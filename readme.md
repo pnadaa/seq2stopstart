@@ -32,6 +32,19 @@ Script logic and documentation were assisted by Gemini 3 Pro via Perplexity Pro.
 Install required Python packages using:\
 pip install biopython matplotlib
 
+## Easy dependency installation and running
+
+First clone the git repository using\
+`git clone https://github.com/pnadaa/seq2stopstart.git`
+
+To run the program, install the uv package manager:\
+`curl -LsSf https://astral.sh/uv/install.sh | sh`\
+or\
+`pip install uv`
+
+Then run `uv sync` in the main directory to sync all packages and install dependencies.
+
+
 ## Input Preparation
 
 1.  FASTA file:
