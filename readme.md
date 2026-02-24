@@ -147,7 +147,7 @@ boundary type, generated when `--plot` is passed.
 ## **Basic run (stop codon distances)**
 
 ```bash
-`python seq2startstop.py \
+python seq2startstop.py \
     --fasta my_IS_sequences.fasta \
     --genbank_dir /data/gbff/ \
     --blast_db /data/blastdb/staph_genomes \
@@ -156,7 +156,7 @@ boundary type, generated when `--plot` is passed.
 ## **Start codon distances, parallelised, with plot**
 
 ```bash
-`python seq2startstop.py \
+python seq2startstop.py \
     --fasta my_IS_sequences.fasta \
     --genbank_dir /data/gbff/ \
     --blast_db /data/blastdb/staph_genomes \
@@ -169,7 +169,7 @@ boundary type, generated when `--plot` is passed.
 ## **Custom GenBank filename pattern**
 
 ```bash
-`python seq2startstop.py \
+python seq2startstop.py \
     --fasta my_IS_sequences.fasta \
     --genbank_dir /data/gbff/ \
     --blast_db /data/blastdb/staph_genomes \
@@ -179,7 +179,7 @@ boundary type, generated when `--plot` is passed.
 ## **PBS job script example**
 
 ```bash
-`#PBS -l ncpus=16,mem=32gb,walltime=4:00:00
+#PBS -l ncpus=16,mem=32gb,walltime=4:00:00
 cd $PBS_O_WORKDIR
 python seq2startstop.py \
     --fasta my_IS_sequences.fasta \

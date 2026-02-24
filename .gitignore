@@ -217,7 +217,7 @@ log/
 *.kman.restech.unsw.edu.au.OU
 
 # Shell scripts, best to keep in but remove if there is any sensitive data
-# .pbs
+.pbs
 
 
 ###############################################################################
