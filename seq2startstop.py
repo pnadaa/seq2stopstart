@@ -122,16 +122,26 @@ def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tup
             min_downstream, min_dist_down if min_downstream else None)
 
 
-def alignment_overlaps_gene(align_start: int, align_end: int, genes: List[Dict[str, Any]]) -> bool:
+def classify_alignment(align_start: int, align_end: int, genes: List[Dict[str, Any]]) -> str:
     """
-    Returns True if [align_start, align_end) overlaps any gene feature.
+    Returns one of:
+      'inside'     – alignment fully contained within a single gene
+      'partial'    – alignment partially overlaps one or more genes
+      'intergenic' – no overlap with any gene
+
     Uses half-open interval arithmetic matching BioPython's SeqFeature
     coordinates. Completely independent of boundary_type.
     """
-    for gene in genes:
-        if align_start < gene['end'] and align_end > gene['start']:
-            return True
-    return False
+    overlapping = [
+        g for g in genes
+        if align_start < g['end'] and align_end > g['start']
+    ]
+    if not overlapping:
+        return 'intergenic'
+    for g in overlapping:
+        if align_start >= g['start'] and align_end <= g['end']:
+            return 'inside'
+    return 'partial'
 
 
 def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False) -> Dict[str, Any]:
@@ -163,9 +173,9 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
         record = next(SeqIO.parse(gb_path, "genbank"))
         genes = extract_genes_with_boundary(record, boundary_type)
 
-        # Geometric overlap check: independent of boundary_type, so inside/outside
+        # Geometric classification: independent of boundary_type, so location
         # counts are consistent across --boundary_type stop and start runs.
-        inside_gene = alignment_overlaps_gene(rel_start, rel_end, genes)
+        location = classify_alignment(rel_start, rel_end, genes)
 
         up_start, up_dist_start, down_start, down_dist_start = find_flanking_genes(rel_start, genes)
         up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(rel_end, genes)
@@ -185,7 +195,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "accession": accession,
             "query": region.get('header'),
             "is_reverse": is_reverse,
-            "is_inside_gene": inside_gene,
+            "location": location,
             "seq_start": start,
             "seq_end": end,
             "align_start": rel_start,
@@ -208,7 +218,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "accession": region_base.get("accession"),
             "query": region_base.get("header"),
             "is_reverse": region_base.get("is_reverse"),
-            "is_inside_gene": None,
+            "location": None,
             "seq_start": region_base.get("start"),
             "seq_end": region_base.get("end"),
             "align_start": None,
@@ -291,7 +301,7 @@ def main():
     parser.add_argument(
         "--plot_name", default="distance_distribution.png",
         help="Filename for the distance distribution plot (default: distance_distribution.png). "
-             "The inside/intergenic plot is saved with '_inside_vs_intergenic' appended to the stem."
+             "The location category plot is saved with '_location' appended to the stem."
     )
     parser.add_argument(
         "--xlim", type=float, nargs=2, metavar=("XMIN", "XMAX"), default=None,
@@ -328,24 +338,22 @@ def main():
     else:
         results = [func(region) for region in regions]
 
-    # Capture inside/outside counts from valid (non-error) results before filtering.
-    # These counts are boundary_type-independent (geometric overlap, not boundary distance).
-    valid_before = [r for r in results if not r['error']]
-    n_inside  = sum(1 for r in valid_before if r.get('is_inside_gene'))
-    n_outside = len(valid_before) - n_inside
+    # Capture counts from all valid (non-error) results before any filtering.
+    # location classification is boundary_type-independent (geometric overlap).
+    valid_before  = [r for r in results if not r['error']]
+    n_inside      = sum(1 for r in valid_before if r.get('location') == 'inside')
+    n_partial     = sum(1 for r in valid_before if r.get('location') == 'partial')
+    n_unannotated = sum(1 for r in valid_before
+                        if r.get('location') == 'intergenic'
+                        and r.get('up_dist') is None
+                        and r.get('down_dist') is None)
+    n_outside     = len(valid_before) - n_inside - n_partial - n_unannotated
 
-    # Filter out alignments that overlap a gene body
-    n_before = len(results)
-    results = [r for r in results if not r.get('is_inside_gene')]
-    n_removed = n_before - len(results)
-    if n_removed:
-        print(f"Filtered out {n_removed} result(s) where alignment overlaps a gene body.")
-
+    # Write full CSV BEFORE filtering — all rows preserved with location values intact
     csv_out_path = output_dir / args.csv_out
-    dist_out_path = output_dir / args.dist_out
     with open(csv_out_path, "w", newline="") as outcsv:
         fieldnames = [
-            "accession", "query", "is_reverse", "is_inside_gene",
+            "accession", "query", "is_reverse", "location",
             "seq_start", "seq_end", "align_start", "align_end",
             "which_boundary_used", "boundary_used",
             "up_gene", "up_boundary", "up_dist",
@@ -357,10 +365,28 @@ def main():
         for r in results:
             writer.writerow(r)
 
+    # Filter 1: alignment fully inside a gene body
+    n_before = len(results)
+    results_filtered = [r for r in results if r.get('location') != 'inside']
+    n_removed = n_before - len(results_filtered)
+    if n_removed:
+        print(f"Filtered out {n_removed} result(s) where alignment is fully inside a gene body.")
+
+    # Filter 2: unannotated regions (intergenic classification but no flanking genes found, no error)
+    n_before = len(results_filtered)
+    results_filtered = [r for r in results_filtered
+                        if r.get('error')
+                        or not (r.get('up_dist') is None and r.get('down_dist') is None)]
+    n_unannotated_removed = n_before - len(results_filtered)
+    if n_unannotated_removed:
+        print(f"Filtered out {n_unannotated_removed} result(s) with no flanking gene annotation.")
+
+    # dist CSV uses filtered results (intergenic + partial only)
+    dist_out_path = output_dir / args.dist_out
     with open(dist_out_path, "w", newline="") as dcsv:
         writer = csv.writer(dcsv)
         writer.writerow(["up_dist", "down_dist"])
-        for r in results:
+        for r in results_filtered:
             if r['error']:
                 continue
             writer.writerow([r['up_dist'], r['down_dist']])
@@ -369,9 +395,9 @@ def main():
         plot_stem   = Path(args.plot_name).stem
         plot_suffix = Path(args.plot_name).suffix or ".png"
 
-        # --- Plot 1: distance distribution (intergenic results only) ---
-        ups   = [float(r['up_dist'])   for r in results if r['up_dist']   is not None and not r['error']]
-        downs = [float(r['down_dist']) for r in results if r['down_dist'] is not None and not r['error']]
+        # --- Plot 1: distance distribution (filtered results only) ---
+        ups   = [float(r['up_dist'])   for r in results_filtered if r['up_dist']   is not None and not r['error']]
+        downs = [float(r['down_dist']) for r in results_filtered if r['down_dist'] is not None and not r['error']]
 
         if not ups and not downs:
             print("Warning: no valid upstream/downstream distances to plot. Skipping distance plot.")
@@ -407,16 +433,13 @@ def main():
             if args.verbose:
                 print(f"Distance plot saved: {(output_dir / args.plot_name).resolve()}")
 
-        # --- Plot 2: inside gene vs intergenic counts ---
+        # --- Plot 2: location category counts (all valid results, pre-filter) ---
         fig2, ax2 = plt.subplots()
-        bars = ax2.bar(
-            ['Inside gene', 'Intergenic'],
-            [n_inside, n_outside],
-            alpha=0.7
-        )
-        # Annotate each bar with its count
-        y_offset = max(n_inside, n_outside) * 0.01 if max(n_inside, n_outside) > 0 else 0.5
-        for bar, count in zip(bars, [n_inside, n_outside]):
+        labels = ['Inside gene', 'Partial overlap', 'Intergenic', 'Unannotated']
+        counts = [n_inside, n_partial, n_outside, n_unannotated]
+        bars = ax2.bar(labels, counts, alpha=0.7)
+        y_offset = max(counts) * 0.01 if max(counts) > 0 else 0.5
+        for bar, count in zip(bars, counts):
             ax2.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + y_offset,
@@ -426,11 +449,11 @@ def main():
         ax2.set_ylabel("Count")
         ax2.set_title(f"Alignment location ({os.path.basename(args.fasta)})")
         fig2.tight_layout()
-        loc_plot_name = f"{plot_stem}_inside_vs_intergenic{plot_suffix}"
+        loc_plot_name = f"{plot_stem}_location{plot_suffix}"
         fig2.savefig(output_dir / loc_plot_name)
         plt.close(fig2)
         if args.verbose:
-            print(f"Inside/intergenic plot saved: {(output_dir / loc_plot_name).resolve()}")
+            print(f"Location plot saved: {(output_dir / loc_plot_name).resolve()}")
 
 
 if __name__ == "__main__":
