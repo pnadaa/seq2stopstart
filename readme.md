@@ -105,6 +105,7 @@ One `.gbff` file per genome. By default, files are expected to be named\
 | `--dist_out` | ❌ | `distances.csv` | Filename for the distances-only CSV |
 | `--plot` | ❌ | off | If set, generate a histogram of upstream/downstream distances |
 | `--plot_name` | ❌ | `distance_distribution.png` | Filename for the histogram image |
+| `--xlim` | ❌ | off | Set the limits for the x axis - usage: --xlim 0 50 for 0-50 |
 | `--verbose` | ❌ | off | Print `blastdbcmd` commands and additional progress info |
 
 ------------------------------------------------------------------------
@@ -164,6 +165,7 @@ python seq2startstop.py \
     --boundary_type start \
     --nproc 8 \
     --plot \
+    --xlim 0 50 \
     --plot_name start_codon_distances.png`
 ```
 ## **Custom GenBank filename pattern**
