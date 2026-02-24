@@ -281,3 +281,4 @@ log/
 get_genbank/fastas/
 results/
 *.txt
+.pbs
