@@ -11,6 +11,7 @@ import csv
 from multiprocessing import Pool
 from functools import partial
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 from typing import Dict, Any, List
 
 
@@ -345,6 +346,9 @@ def main():
             plt.title(plot_title)
             if args.xlim is not None:
                 plt.xlim(args.xlim[0], args.xlim[1])
+                plt.gca().xaxis.set_major_locator(
+                    MaxNLocator(nbins=auto, steps=[1, 2, 5, 10, 20, 50, 100], integer = True)
+                )
             plt.legend()
             plt.tight_layout()
             plt.savefig(output_dir / args.plot_name)
