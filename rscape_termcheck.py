@@ -3,7 +3,8 @@
 import argparse
 import os
 from pathlib import Path
-from Bio import SeqIO, pairwise2
+from Bio import SeqIO
+from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 import subprocess
 import csv
@@ -12,10 +13,11 @@ from functools import partial
 import matplotlib.pyplot as plt
 from typing import Dict, Any, List
 
-def extract_sequence_with_blastdbcmd(accession: str, start: int, end: int, blast_db: str, temp_dir: str, verbose: bool=False) -> str:
+
+def extract_sequence_with_blastdbcmd(accession: str, start: int, end: int, blast_db: str, temp_dir: str, verbose: bool = False) -> str:
     out_fasta = os.path.join(temp_dir, f"{accession}_{start}_{end}.fa")
     blast_cmd = [
-        "blastdbcmd", "-db", blast_db,
+        "blastdbcmd", "-db", blast_db,      # blast_db is a prefix e.g. /data/blastdb/mydb
         "-entry", accession,
         "-range", f"{start}-{end}",
         "-outfmt", "%f", "-out", out_fasta
@@ -28,24 +30,49 @@ def extract_sequence_with_blastdbcmd(accession: str, start: int, end: int, blast
     os.remove(out_fasta)
     return seq
 
+
 def align_query_to_ref(query_rna: str, ref_dna: str) -> Dict[str, Any] | None:
+    """
+    Local pairwise alignment of query against forward reference using
+    Bio.Align.PairwiseAligner (replaces deprecated Bio.pairwise2).
+
+    Scoring: match=2, mismatch=-1, gap open=-2, gap extend=-0.5
+    Both query and its reverse complement are tried; the best-scoring
+    alignment is returned.  Alignment offsets are always into the forward
+    reference sequence, so coordinate remapping downstream is correct
+    regardless of IS orientation.
+    """
+    aligner = PairwiseAligner()
+    aligner.mode = 'local'
+    aligner.match_score = 2
+    aligner.mismatch_score = -1
+    aligner.open_gap_score = -2
+    aligner.extend_gap_score = -0.5
+
     query_dna = query_rna.replace('U', 'T')
     query_rc = str(Seq(query_dna).reverse_complement())
+
     best = None
     for strand, q in [('+', query_dna), ('-', query_rc)]:
-        aligns = pairwise2.align.localms(ref_dna, q, 2, -1, -2, -0.5)
-        if aligns:
-            aln = aligns[0]
-            s = {
-                'strand': strand,
-                'score': aln.score,
-                'start': aln.start,
-                'end': aln.end,
-                'aln': aln
-            }
-            if best is None or s['score'] > best['score']:
-                best = s
+        alignments = aligner.align(ref_dna, q)
+        try:
+            aln = next(iter(alignments))
+        except StopIteration:
+            continue
+        # aln.aligned[0] holds (start, end) pairs for each aligned block
+        # in the target (ref_dna); take outermost positions.
+        ref_blocks = aln.aligned[0]
+        s = {
+            'strand': strand,
+            'score': aln.score,
+            'start': int(ref_blocks[0][0]),
+            'end': int(ref_blocks[-1][1]),
+            'aln': aln
+        }
+        if best is None or s['score'] > best['score']:
+            best = s
     return best
+
 
 def extract_genes_with_boundary(gb_record: Any, boundary_type: str) -> List[Dict[str, Any]]:
     genes = []
@@ -67,6 +94,7 @@ def extract_genes_with_boundary(gb_record: Any, boundary_type: str) -> List[Dict
                 'boundary': int(boundary)
             })
     return genes
+
 
 def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tuple:
     min_upstream = None
@@ -92,17 +120,17 @@ def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tup
     return (min_upstream, min_dist_up if min_upstream else None,
             min_downstream, min_dist_down if min_downstream else None)
 
-def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool=False) -> Dict[str, Any]:
+
+def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False) -> Dict[str, Any]:
     try:
         accession = region['accession']
         start, end = region['start'], region['end']   # always start <= end after parse_fasta_regions
         is_reverse = region.get('is_reverse', False)
-        blast_db = blast_db_dir
 
-        # blastdbcmd always receives start <= end; align_query_to_ref handles strand
-        # internally by aligning both query_dna and query_rc against the forward reference.
-        # Alignment offsets are therefore always into the forward sequence, so the
-        # remapping below is correct regardless of the IS orientation.
+        # blastdbcmd always receives start <= end (normalised in parse_fasta_regions).
+        # align_query_to_ref tries both query_dna and query_rc against the forward
+        # reference, so reverse-strand entries align correctly without RC'ing ref_seq.
+        # Alignment offsets are indices into the forward reference → remapping is correct.
         ref_seq = extract_sequence_with_blastdbcmd(accession, start, end, blast_db, temp_dir, verbose)
         best_aln = align_query_to_ref(region['sequence'], ref_seq)
         if not best_aln:
@@ -112,7 +140,11 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: s
         rel_start = coord_window_start + best_aln['start']
         rel_end   = coord_window_start + best_aln['end']
 
-        gb_path = Path(genbank_dir) / f"{accession}.gbff" if gb_naming == "accession" else Path(genbank_dir) / gb_naming.format(accession=accession)
+        gb_path = (
+            Path(genbank_dir) / f"{accession}.gbff"
+            if gb_naming == "accession"
+            else Path(genbank_dir) / gb_naming.format(accession=accession)
+        )
         if not gb_path.exists():
             raise FileNotFoundError(f"Missing GenBank file: {gb_path}")
         record = next(SeqIO.parse(gb_path, "genbank"))
@@ -122,15 +154,15 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: s
         up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(rel_end, genes)
         distances = [
             ("start", rel_start, up_start, up_dist_start, down_start, down_dist_start),
-            ("end",   rel_end,  up_end,   up_dist_end,  down_end,  down_dist_end)
+            ("end",   rel_end,   up_end,   up_dist_end,   down_end,   down_dist_end)
         ]
         min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
         which, rel_boundary, up_gene, up_dist, down_gene, down_dist = min_tuple
 
-        up_gene_name       = up_gene['gene']       if up_gene   else None
-        up_gene_boundary   = up_gene['boundary']   if up_gene   else None
-        down_gene_name     = down_gene['gene']      if down_gene else None
-        down_gene_boundary = down_gene['boundary']  if down_gene else None
+        up_gene_name       = up_gene['gene']      if up_gene   else None
+        up_gene_boundary   = up_gene['boundary']  if up_gene   else None
+        down_gene_name     = down_gene['gene']     if down_gene else None
+        down_gene_boundary = down_gene['boundary'] if down_gene else None
 
         return {
             "accession": accession,
@@ -175,8 +207,10 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: s
             "error": str(e)
         }
 
-def _proc(region: Dict[str, Any], genbank_dir: str, blast_db_dir: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool) -> Dict[str, Any]:
-    return process_one_region(region, genbank_dir, blast_db_dir, temp_dir, gb_naming, boundary_type, verbose)
+
+def _proc(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool) -> Dict[str, Any]:
+    return process_one_region(region, genbank_dir, blast_db, temp_dir, gb_naming, boundary_type, verbose)
+
 
 def parse_fasta_regions(fasta_path: str) -> List[Dict[str, Any]]:
     results = []
@@ -192,9 +226,9 @@ def parse_fasta_regions(fasta_path: str) -> List[Dict[str, Any]]:
             accession = parts[0]
             raw_start, raw_end = int(coords[0]), int(coords[1])
 
-            # FIX: detect reverse-strand entries (start > end) and normalise so that
-            # blastdbcmd always receives a valid ascending range, and alignment offsets
-            # remain indices into the forward sequence for correct genomic remapping.
+            # Detect reverse-strand entries (start > end) and normalise so that
+            # blastdbcmd always receives a valid ascending range, and alignment
+            # offsets remain indices into the forward sequence for correct remapping.
             is_reverse = raw_start > raw_end
             start = min(raw_start, raw_end)
             end   = max(raw_start, raw_end)
@@ -211,16 +245,26 @@ def parse_fasta_regions(fasta_path: str) -> List[Dict[str, Any]]:
             print(f"Error parsing FASTA header: {header}. Exception: {e}")
     return results
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Region/genbank/BLAST pipeline with gene boundaries (start/stop) switchable by argument.")
+    parser = argparse.ArgumentParser(
+        description="Region/genbank/BLAST pipeline with gene boundaries (start/stop) switchable by argument."
+    )
     parser.add_argument("--fasta", required=True)
     parser.add_argument("--genbank_dir", required=True)
-    parser.add_argument("--blast_db_dir", required=True)
+    parser.add_argument(
+        "--blast_db", required=True,
+        help="Path to the BLAST+ database prefix (e.g. /data/blastdb/mydb), "
+             "as passed to makeblastdb -out. Not a directory."
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--gb_naming", default="accession")
     parser.add_argument("--boundary_type", choices=["stop", "start"], default="stop",
                         help="Compare distance to either stop (default) or start codons of flanking genes")
-    parser.add_argument("--nproc", default=1, type=int)
+    parser.add_argument(
+        "--nproc", default=1, type=int,
+        help="Number of parallel worker processes. Set this to match your number of CPUs Default: 1."
+    )
     parser.add_argument("--csv_out", default="coordinates_with_genes.csv")
     parser.add_argument("--dist_out", default="distances.csv")
     parser.add_argument("--plot", action="store_true")
@@ -228,6 +272,7 @@ def main():
                         help="File name for the plot image (default: distance_distribution.png)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
     print("\nArguments used:")
     for arg, val in vars(args).items():
         print(f"  {arg}: {val}")
@@ -240,9 +285,15 @@ def main():
         print(f"Temp dir: {temp_dir.resolve()}")
 
     regions = parse_fasta_regions(args.fasta)
-    func = partial(_proc, genbank_dir=args.genbank_dir, blast_db_dir=args.blast_db_dir,
-                   temp_dir=str(temp_dir), gb_naming=args.gb_naming, boundary_type=args.boundary_type,
-                   verbose=args.verbose)
+    func = partial(
+        _proc,
+        genbank_dir=args.genbank_dir,
+        blast_db=args.blast_db,
+        temp_dir=str(temp_dir),
+        gb_naming=args.gb_naming,
+        boundary_type=args.boundary_type,
+        verbose=args.verbose
+    )
     if args.nproc > 1:
         with Pool(args.nproc) as pool:
             results = pool.map(func, regions)
@@ -264,6 +315,7 @@ def main():
         writer.writeheader()
         for r in results:
             writer.writerow(r)
+
     with open(dist_out_path, "w", newline="") as dcsv:
         writer = csv.writer(dcsv)
         writer.writerow(["up_dist", "down_dist"])
@@ -271,6 +323,7 @@ def main():
             if r['error']:
                 continue
             writer.writerow([r['up_dist'], r['down_dist']])
+
     if args.plot:
         ups   = [float(r['up_dist'])   for r in results if r['up_dist']   is not None and not r['error']]
         downs = [float(r['down_dist']) for r in results if r['down_dist'] is not None and not r['error']]
