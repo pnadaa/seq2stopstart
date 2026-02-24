@@ -1,125 +1,214 @@
-# Genomic Region-Gene Distance Analysis Script
+# IS Boundary Locator
+
+A pipeline for mapping genomic sequences to a BLAST database, aligning them
+against their reference regions, and identifying the nearest flanking gene
+boundaries (start or stop codons) on both sides of each alignment.
+
+Designed for high-throughput analysis of insertion sequences or other mobile
+genetic elements across many bacterial genomes.
+
+---
 
 ## Overview
 
-This script analyzes a set of genomic sequences described in a FASTA file (with headers giving the genome accession and genomic coordinates). For each region, it:
+For each sequence in an input FASTA file, this tool:
 
--   Maps the region sequence to a corresponding genome using a local BLAST database.
+1. Parses the genomic coordinates from the FASTA header (`ACCESSION_START-END`)
+2. Extracts the reference window from a local BLAST database using `blastdbcmd`
+3. Performs strand-aware Smith–Waterman local alignment of the query against
+   the reference window
+4. Parses the corresponding GenBank file to retrieve gene feature boundaries
+5. Identifies the closest upstream and downstream gene (by stop codon or start
+   codon, configurable) relative to the alignment
+6. Writes results to CSV and optionally plots a distance distribution histogram
 
--   Looks up the closest annotated upstream and downstream genes (from a local GenBank file).
-
--   Calculates the distance from the region to the stop codon of each flanking gene, taking gene strand into account.
-
--   Outputs these results as CSV files and (optionally) a summarized histogram plot.
-
-All database and annotation access is performed locally. No internet/Entrez queries are issued.
-Script logic and documentation were assisted by Gemini 3 Pro via Perplexity Pro.
+---
 
 ## Requirements
 
--   Python 3.7 or higher
+### Software
 
--   Biopython
+- Python ≥ 3.10 (uses `X | Y` union type hints)
+- NCBI BLAST+ (`blastdbcmd` must be on your `PATH`)
 
--   matplotlib
-
--   BLAST+ suite (blastn, makeblastdb)
-
--   Local BLAST nucleotide databases (one per genomic accession)
-
--   Local GenBank files (.gbff/.gbk) for your genomic sequences
-
-Install required Python packages using:\
-pip install biopython matplotlib
-
-## Easy dependency installation and running
-
-First clone the git repository using\
-`git clone https://github.com/pnadaa/seq2stopstart.git`
-
-To run the program, install the uv package manager:\
-`curl -LsSf https://astral.sh/uv/install.sh | sh`\
-or\
-`pip install uv`
-
-Then run `uv sync` in the main directory to sync all packages and install dependencies.
+### Python Dependencies
+biopython\
+matplotlib
 
 
-## Input Preparation
+Install with:
 
-1.  FASTA file:
+```bash
+pip install biopython matplotlib ```
 
-    -   Each sequence header must use format:\
-        \<ACCESSION\>\_\<START\>-\<END\>\
-        Example:
+> **⚠️ Deprecation Warning: This script uses `Bio.pairwise2`, which was\
+> deprecated in Biopython 1.80. It will still function in current releases but\
+> may be removed in a future version. Consider migrating to\
+> `Bio.Align.PairwiseAligner` for long-term compatibility.**
 
-        > **CP040883_1799184-1799626\
-        > AGGGUUAAA...**
+------------------------------------------------------------------------
 
-2.  GenBank files:
+## **Input Files**
 
-    -   Download GenBank files for each accession and place in the folder indicated by --genbank_dir.
+## **FASTA file (`--fasta`)**
 
-    -   Files should be named as \<accession\>.gbff or according to your naming convention.
+Each record must have a header in the format:
 
-3.  BLAST databases:
+```text
 
-    -   For each genome, prepare a BLAST nucleotide database with:\
-        makeblastdb -in CP040883.fna -dbtype nucl -out ./blastdbs/CP040883
+`>ACCESSION_START-END`
 
-    -   The database for each accession should be in the folder specified by --blast_db_dir.
+-   `ACCESSION` — the sequence accession as it appears in your BLAST database
 
-## Usage
+-   `START` and `END` — 1-based genomic coordinates of the region
 
-Example usage:
+-   If `START > END`, the entry is treated as reverse-strand and coordinates are\
+    automatically normalised
+```
+
+**Example headers:**
+
+```         
 
 
-`python your_script_name.py \
-  --fasta regions.fasta \
-  --genbank_dir ./genbanks \
-  --blast_db_dir ./blastdbs \
-  --output_dir ./results \
-  --nproc 4 \
-  --verbose \
-  --plot`
+`>CP000253_1234000-1235500
+>AE006468_500000-498200`
+```
+## **BLAST database (`--blast_db_dir`)**
 
-Required arguments:\
---fasta Path to input FASTA file\
---genbank_dir Path to folder containing GenBank files\
---blast_db_dir Path to folder containing BLAST databases for each genome\
---output_dir Path to output directory (all results and temp files go here)
+A local BLAST nucleotide database built with `makeblastdb`, containing the\
+genomes corresponding to the accessions in your FASTA file.
 
-Optional arguments:\
---gb_naming Naming pattern for GenBank files (default: accession, e.g. CP040883.gbff)\
---nproc Number of processes to use (default: 1)\
---csv_out Name of full info output CSV (default: coordinates_with_genes.csv)\
---dist_out Name of distances CSV (default: distances.csv)\
---plot If present, saves histogram plot of distances as PNG file\
---verbose Enable verbose logging/status output
+## **GenBank files (`--genbank_dir`)**
 
-## Output
+One `.gbff` file per genome. By default, files are expected to be named\
+`{ACCESSION}.gbff`. This can be customised with `--gb_naming`.
 
-All outputs are placed in the directory specified by --output_dir:
+------------------------------------------------------------------------
 
--   \[csv_out\]: CSV with all region information, gene mapping, distances, alignment orientation, error reporting.
+## **Usage**
 
--   \[dist_out\]: CSV with just the distances, for plotting/comparative work.
+```         
+bash
+```
 
--   distance_distribution.png: If --plot is set, contains a histogram plot of upstream and downstream distances.
+`python is_boundary_locator.py \
+    --fasta sequences.fasta \
+    --genbank_dir /path/to/gbff/ \
+    --blast_db_dir /path/to/blastdb/mydb \
+    --output_dir results/`
 
--   blast_tmp/: Temporary folder for BLAST queries and intermediate files.
+## **Full argument reference**
 
-## Notes
+| **Argument** | **Required** | **Default** | **Description** |
+|:---|:---|:---|:---|
+| `--fasta` | ✅ | — | Input FASTA file with `ACCESSION_START-END` headers |
+| `--genbank_dir` | ✅ | — | Directory containing GenBank (`.gbff`) files |
+| `--blast_db_dir` | ✅ | — | Path to the BLAST database (prefix, not directory) |
+| `--output_dir` | ✅ | — | Directory for all output files |
+| `--gb_naming` | ❌ | `accession` | GenBank filename pattern; use `{accession}` as placeholder, e.g. `{accession}_genomic.gbff` |
+| `--boundary_type` | ❌ | `stop` | Gene boundary to measure distance to: `stop` or `start` |
+| `--nproc` | ❌ | `1` | Number of parallel worker processes |
+| `--csv_out` | ❌ | `coordinates_with_genes.csv` | Filename for the main results CSV |
+| `--dist_out` | ❌ | `distances.csv` | Filename for the distances-only CSV |
+| `--plot` | ❌ | off | If set, generate a histogram of upstream/downstream distances |
+| `--plot_name` | ❌ | `distance_distribution.png` | Filename for the histogram image |
+| `--verbose` | ❌ | off | Print `blastdbcmd` commands and additional progress info |
 
--   Both GenBank and BLAST DBs must be present locally for every genome accession.
+------------------------------------------------------------------------
 
--   Mapping is done with blastn, checking both the sequence and its reverse complement.
+## **Output Files**
 
--   Distances are in base pairs, measured from the boundary of each mapped region to the nearest stop codon (based on annotation strand).
+## **`coordinates_with_genes.csv` (main output)**
 
--   Output CSV contains an "error" field for cases where mapping or annotation fails.
+One row per input sequence. Columns:
 
-## Contact
+| **Column** | **Description** |
+|:---|:---|
+| `accession` | Genome accession |
+| `query` | Original FASTA header |
+| `is_reverse` | Whether the input coordinates implied a reverse-strand entry |
+| `seq_start` / `seq_end` | Normalised (ascending) input coordinate window |
+| `align_start` / `align_end` | Absolute genomic coordinates of the best alignment |
+| `which_boundary_used` | Whether `start` or `end` of the alignment was used to find the closest gene |
+| `boundary_used` | Absolute coordinate of the selected alignment boundary |
+| `up_gene` / `up_boundary` / `up_dist` | Locus tag, boundary coordinate, and distance of the upstream flanking gene |
+| `down_gene` / `down_boundary` / `down_dist` | Locus tag, boundary coordinate, and distance of the downstream flanking gene |
+| `score` | Smith–Waterman alignment score |
+| `strand` | Alignment strand (`+` or `-`) |
+| `error` | Error message if processing failed; `None` on success |
 
-For support or bug reports, contact the script author.\
-If using on an HPC/cluster, or with very large datasets, consider running with --nproc and ensure /tmp or --output_dir has adequate space for BLAST files.
+## **`distances.csv`**
+
+Two-column file (`up_dist`, `down_dist`) containing only the numeric distances\
+for successfully processed entries. Convenient for downstream statistical\
+analysis.
+
+## **`distance_distribution.png` (optional)**
+
+Histogram of upstream and downstream distances to the configured boundary type\
+(stop or start codons), generated when `--plot` is passed.
+
+------------------------------------------------------------------------
+
+## **Examples**
+
+## **Basic run**
+
+```         
+bash
+```
+
+`python is_boundary_locator.py \
+    --fasta my_IS_sequences.fasta \
+    --genbank_dir /data/gbff/ \
+    --blast_db_dir /data/blastdb/staph_genomes \
+    --output_dir out/`
+
+## **Measure distance to start codons, with parallelisation and a plot**
+
+```         
+bash
+```
+
+`python is_boundary_locator.py \
+    --fasta my_IS_sequences.fasta \
+    --genbank_dir /data/gbff/ \
+    --blast_db_dir /data/blastdb/staph_genomes \
+    --output_dir out/ \
+    --boundary_type start \
+    --nproc 8 \
+    --plot \
+    --plot_name start_codon_distances.png`
+
+## **Custom GenBank filename pattern**
+
+```         
+bash
+```
+
+`python is_boundary_locator.py \
+    --fasta my_IS_sequences.fasta \
+    --genbank_dir /data/gbff/ \
+    --blast_db_dir /data/blastdb/staph_genomes \
+    --output_dir out/ \
+    --gb_naming "{accession}_genomic.gbff"`
+
+------------------------------------------------------------------------
+
+## **Notes**
+
+-   The temporary directory `<output_dir>/blast_tmp/` is created automatically\
+    for intermediate `blastdbcmd` FASTA files and cleaned up per-query.
+
+-   Sequences that fail (missing GenBank file, no alignment found, etc.) are\
+    written to the output CSV with their `error` column populated rather than\
+    halting the pipeline.
+
+-   Alignment uses `localms` scoring: match `+2`, mismatch `−1`, gap open `−2`,\
+    gap extend `−0.5`.
+
+-   When using `--nproc > 1`, ensure the temp directory is on a filesystem that\
+    handles concurrent writes safely (e.g., avoid NFS with high contention).
+
+```         

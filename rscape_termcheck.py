@@ -57,7 +57,7 @@ def extract_genes_with_boundary(gb_record: Any, boundary_type: str) -> List[Dict
             loc = feat.location
             if boundary_type == "stop":
                 boundary = loc.end - 1 if strand == 1 else loc.start
-            else:  # start codon
+            else:
                 boundary = loc.start if strand == 1 else loc.end - 1
             genes.append({
                 'gene': gene,
@@ -95,14 +95,20 @@ def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tup
 def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool=False) -> Dict[str, Any]:
     try:
         accession = region['accession']
-        start, end = region['start'], region['end']
+        start, end = region['start'], region['end']   # always start <= end after parse_fasta_regions
+        is_reverse = region.get('is_reverse', False)
         blast_db = blast_db_dir
+
+        # blastdbcmd always receives start <= end; align_query_to_ref handles strand
+        # internally by aligning both query_dna and query_rc against the forward reference.
+        # Alignment offsets are therefore always into the forward sequence, so the
+        # remapping below is correct regardless of the IS orientation.
         ref_seq = extract_sequence_with_blastdbcmd(accession, start, end, blast_db, temp_dir, verbose)
         best_aln = align_query_to_ref(region['sequence'], ref_seq)
         if not best_aln:
             raise RuntimeError("No good alignment found")
 
-        coord_window_start, coord_window_end = start, end
+        coord_window_start = start          # normalised min coordinate
         rel_start = coord_window_start + best_aln['start']
         rel_end   = coord_window_start + best_aln['end']
 
@@ -121,14 +127,15 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: s
         min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
         which, rel_boundary, up_gene, up_dist, down_gene, down_dist = min_tuple
 
-        up_gene_name  = up_gene['gene']  if up_gene else None
-        up_gene_boundary  = up_gene['boundary']  if up_gene else None
-        down_gene_name = down_gene['gene'] if down_gene else None
-        down_gene_boundary = down_gene['boundary'] if down_gene else None
+        up_gene_name       = up_gene['gene']       if up_gene   else None
+        up_gene_boundary   = up_gene['boundary']   if up_gene   else None
+        down_gene_name     = down_gene['gene']      if down_gene else None
+        down_gene_boundary = down_gene['boundary']  if down_gene else None
 
         return {
             "accession": accession,
             "query": region.get('header'),
+            "is_reverse": is_reverse,
             "seq_start": start,
             "seq_end": end,
             "align_start": rel_start,
@@ -150,6 +157,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db_dir: s
         return {
             "accession": region_base.get("accession"),
             "query": region_base.get("header"),
+            "is_reverse": region_base.get("is_reverse"),
             "seq_start": region_base.get("start"),
             "seq_end": region_base.get("end"),
             "align_start": None,
@@ -182,11 +190,20 @@ def parse_fasta_regions(fasta_path: str) -> List[Dict[str, Any]]:
             if len(coords) != 2:
                 raise ValueError(f"Coordinates not found or badly formatted in FASTA header: {header}")
             accession = parts[0]
-            start, end = int(coords[0]), int(coords[1])
+            raw_start, raw_end = int(coords[0]), int(coords[1])
+
+            # FIX: detect reverse-strand entries (start > end) and normalise so that
+            # blastdbcmd always receives a valid ascending range, and alignment offsets
+            # remain indices into the forward sequence for correct genomic remapping.
+            is_reverse = raw_start > raw_end
+            start = min(raw_start, raw_end)
+            end   = max(raw_start, raw_end)
+
             results.append({
                 "accession": accession,
                 "start": start,
                 "end": end,
+                "is_reverse": is_reverse,
                 "sequence": str(rec.seq),
                 "header": header
             })
@@ -236,7 +253,8 @@ def main():
     dist_out_path = output_dir / args.dist_out
     with open(csv_out_path, "w", newline="") as outcsv:
         fieldnames = [
-            "accession", "query", "seq_start", "seq_end", "align_start", "align_end",
+            "accession", "query", "is_reverse",
+            "seq_start", "seq_end", "align_start", "align_end",
             "which_boundary_used", "boundary_used",
             "up_gene", "up_boundary", "up_dist",
             "down_gene", "down_boundary", "down_dist",
@@ -254,10 +272,10 @@ def main():
                 continue
             writer.writerow([r['up_dist'], r['down_dist']])
     if args.plot:
-        ups = [float(r['up_dist']) for r in results if r['up_dist'] is not None and not r['error']]
+        ups   = [float(r['up_dist'])   for r in results if r['up_dist']   is not None and not r['error']]
         downs = [float(r['down_dist']) for r in results if r['down_dist'] is not None and not r['error']]
         plot_title = f"{args.boundary_type.capitalize()} distance distribution ({os.path.basename(args.fasta)})"
-        plt.hist(ups, bins=40, alpha=0.7, label="Upstream")
+        plt.hist(ups,   bins=40, alpha=0.7, label="Upstream")
         plt.hist(downs, bins=40, alpha=0.7, label="Downstream")
         plt.xlabel(f"Distance to {args.boundary_type} codon (bp)")
         plt.ylabel("Count")
