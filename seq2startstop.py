@@ -124,16 +124,105 @@ def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tup
             min_downstream, min_dist_down if min_downstream else None)
 
 
-def alignment_overlaps_gene(align_start: int, align_end: int, genes: List[Dict[str, Any]]) -> bool:
+def classify_alignment(align_start: int, align_end: int, genes: List[Dict[str, Any]]) -> str:
     """
-    Returns True if [align_start, align_end) overlaps any gene feature.
+    Returns one of:
+      'inside'     – alignment fully contained within a single gene
+      'partial'    – alignment partially overlaps one or more genes
+      'intergenic' – no overlap with any gene
+
     Uses half-open interval arithmetic matching BioPython's SeqFeature
     coordinates. Completely independent of boundary_type.
     """
-    for gene in genes:
-        if align_start < gene['end'] and align_end > gene['start']:
-            return True
-    return False
+    overlapping = [
+        g for g in genes
+        if align_start < g['end'] and align_end > g['start']
+    ]
+    if not overlapping:
+        return 'intergenic'
+    for g in overlapping:
+        if align_start >= g['start'] and align_end <= g['end']:
+            return 'inside'
+    return 'partial'
+
+
+def _random_one_accession(
+    accession: str,
+    lengths: List[int],
+    genbank_dir: str,
+    gb_naming: str,
+    boundary_type: str,
+    n_random: int,
+    seed: int,
+    verbose: bool = False
+) -> tuple[List[float], List[float]]:
+    """
+    Randomly place n_random sequences of sampled lengths within one genome.
+    Each accession receives a deterministic but unique seed derived from the
+    global seed so results are reproducible regardless of process order.
+    Applies the same inside-gene and unannotated filters as the real pipeline.
+    """
+    rng = np.random.default_rng(seed)
+
+    gb_path = (
+        Path(genbank_dir) / f"{accession}.gbff"
+        if gb_naming == "accession"
+        else Path(genbank_dir) / gb_naming.format(accession=accession)
+    )
+    if not gb_path.exists():
+        print(f"Warning: GenBank file not found for {accession}, skipping random control.")
+        return [], []
+
+    record = next(SeqIO.parse(gb_path, "genbank"))
+    genome_length = len(record.seq)
+    genes = extract_genes_with_boundary(record, boundary_type)
+
+    if verbose:
+        print(f"Generating {n_random} random placements for {accession} "
+              f"(genome length: {genome_length:,} bp)")
+
+    rand_ups, rand_downs = [], []
+    placed = 0
+    attempts = 0
+    max_attempts = n_random * 20
+
+    while placed < n_random and attempts < max_attempts:
+        attempts += 1
+        length = int(rng.choice(lengths))
+        if length >= genome_length:
+            continue
+        rand_start = int(rng.integers(0, genome_length - length))
+        rand_end = rand_start + length
+
+        # Apply same geometric filter as real pipeline
+        location = classify_alignment(rand_start, rand_end, genes)
+        if location == 'inside':
+            continue
+
+        up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
+        up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes)
+        distances = [
+            ("start", rand_start, up_s, up_d_s, down_s, down_d_s),
+            ("end",   rand_end,   up_e, up_d_e, down_e, down_d_e)
+        ]
+        min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
+        _, _, up_gene, up_dist, down_gene, down_dist = min_tuple
+
+        # Apply same unannotated filter as real pipeline
+        if up_dist is None and down_dist is None:
+            continue
+
+        if up_dist is not None:
+            rand_ups.append(float(up_dist))
+        if down_dist is not None:
+            rand_downs.append(float(down_dist))
+        placed += 1
+
+    if placed < n_random:
+        print(f"Warning: only placed {placed}/{n_random} random sequences for "
+              f"{accession} after {max_attempts} attempts.")
+
+    return rand_ups, rand_downs
 
 
 def run_random_controls(
@@ -143,89 +232,38 @@ def run_random_controls(
     boundary_type: str,
     n_random: int,
     seed: int,
+    nproc: int = 1,
     verbose: bool = False
 ) -> tuple[List[float], List[float]]:
     """
-    For each unique accession in results_filtered, randomly place n_random
-    sequences across the genome. Sequence lengths are sampled from the real
-    alignment lengths for that accession, preserving the observed length
-    distribution. Applies the same inside-gene and unannotated filters as the
-    real pipeline so the null and real distributions are directly comparable.
-    Returns (random_ups, random_downs).
+    Collects alignment lengths per accession from filtered real results, then
+    dispatches per-accession random placement to _random_one_accession.
+    Parallelised across accessions using the same --nproc as the real pipeline.
+    Each accession gets a unique deterministic seed (seed + accession_index).
     """
-    rng = np.random.default_rng(seed)
-
-    # Collect alignment lengths per accession from real filtered results
-    accession_lengths = defaultdict(list)
+    accession_lengths: Dict[str, List[int]] = defaultdict(list)
     for r in results_filtered:
         if not r.get('error') and r.get('align_start') is not None and r.get('align_end') is not None:
             length = r['align_end'] - r['align_start']
             if length > 0:
                 accession_lengths[r['accession']].append(length)
 
-    random_ups = []
-    random_downs = []
+    # Build task list with per-accession seeds: seed+i ensures reproducibility
+    # regardless of which worker handles which accession.
+    tasks = [
+        (acc, lengths, genbank_dir, gb_naming, boundary_type, n_random, seed + i, verbose)
+        for i, (acc, lengths) in enumerate(accession_lengths.items())
+    ]
 
-    for accession, lengths in accession_lengths.items():
-        gb_path = (
-            Path(genbank_dir) / f"{accession}.gbff"
-            if gb_naming == "accession"
-            else Path(genbank_dir) / gb_naming.format(accession=accession)
-        )
-        if not gb_path.exists():
-            print(f"Warning: GenBank file not found for {accession}, skipping random control.")
-            continue
+    if nproc > 1:
+        with Pool(nproc) as pool:
+            per_accession = pool.starmap(_random_one_accession, tasks)
+    else:
+        per_accession = [_random_one_accession(*t) for t in tasks]
 
-        record = next(SeqIO.parse(gb_path, "genbank"))
-        genome_length = len(record.seq)
-        genes = extract_genes_with_boundary(record, boundary_type)
-
-        if verbose:
-            print(f"Generating {n_random} random placements for {accession} "
-                  f"(genome length: {genome_length:,} bp)")
-
-        placed = 0
-        attempts = 0
-        max_attempts = n_random * 20
-
-        while placed < n_random and attempts < max_attempts:
-            attempts += 1
-            length = int(rng.choice(lengths))
-            if length >= genome_length:
-                continue
-            rand_start = int(rng.integers(0, genome_length - length))
-            rand_end = rand_start + length
-
-            # Apply same geometric filter as real pipeline
-            location = classify_alignment(rand_start, rand_end, genes)
-            if location == 'inside':
-                continue
-
-            up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
-            up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes)
-
-            distances = [
-                ("start", rand_start, up_s, up_d_s, down_s, down_d_s),
-                ("end",   rand_end,   up_e, up_d_e, down_e, down_d_e)
-            ]
-            min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
-            _, _, up_gene, up_dist, down_gene, down_dist = min_tuple
-
-            # Apply same unannotated filter as real pipeline
-            if up_dist is None and down_dist is None:
-                continue
-
-            if up_dist is not None:
-                random_ups.append(float(up_dist))
-            if down_dist is not None:
-                random_downs.append(float(down_dist))
-            placed += 1
-
-        if placed < n_random:
-            print(f"Warning: only placed {placed}/{n_random} random sequences for "
-                  f"{accession} after {max_attempts} attempts.")
-
-    return random_ups, random_downs
+    rand_ups   = [v for ups, _    in per_accession for v in ups]
+    rand_downs = [v for _,  downs in per_accession for v in downs]
+    return rand_ups, rand_downs
 
 
 def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False) -> Dict[str, Any]:
@@ -257,9 +295,9 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
         record = next(SeqIO.parse(gb_path, "genbank"))
         genes = extract_genes_with_boundary(record, boundary_type)
 
-        # Geometric overlap check: independent of boundary_type, so inside/outside
+        # Geometric classification: independent of boundary_type, so location
         # counts are consistent across --boundary_type stop and start runs.
-        inside_gene = alignment_overlaps_gene(rel_start, rel_end, genes)
+        location = classify_alignment(rel_start, rel_end, genes)
 
         up_start, up_dist_start, down_start, down_dist_start = find_flanking_genes(rel_start, genes)
         up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(rel_end, genes)
@@ -279,7 +317,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "accession": accession,
             "query": region.get('header'),
             "is_reverse": is_reverse,
-            "is_inside_gene": inside_gene,
+            "location": location,
             "seq_start": start,
             "seq_end": end,
             "align_start": rel_start,
@@ -302,7 +340,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "accession": region_base.get("accession"),
             "query": region_base.get("header"),
             "is_reverse": region_base.get("is_reverse"),
-            "is_inside_gene": None,
+            "location": None,
             "seq_start": region_base.get("start"),
             "seq_end": region_base.get("end"),
             "align_start": None,
@@ -377,20 +415,16 @@ def main():
     parser.add_argument(
         "--nproc", default=1, type=int,
         help="Number of parallel worker processes. On PBS, set this to match your "
-             "ncpus allocation (e.g. #PBS -l ncpus=8 → --nproc 8). Default: 1."
+             "ncpus allocation (e.g. #PBS -l ncpus=8 → --nproc 8). "
+             "Applied to both real region processing and random control generation."
     )
     parser.add_argument("--csv_out", default="coordinates_with_genes.csv")
     parser.add_argument("--dist_out", default="distances.csv")
     parser.add_argument("--plot", action="store_true")
     parser.add_argument(
         "--plot_name", default="distance_distribution.png",
-<<<<<<< HEAD
         help="Filename for the distance distribution plot. "
              "The location category plot is saved with '_location' appended to the stem."
-=======
-        help="Filename for the distance distribution plot (default: distance_distribution.png). "
-             "The inside/intergenic plot is saved with '_inside_vs_intergenic' appended to the stem."
->>>>>>> parent of 05c29cf (Added accounting for partial overlaps)
     )
     parser.add_argument(
         "--xlim", type=float, nargs=2, metavar=("XMIN", "XMAX"), default=None,
@@ -405,7 +439,8 @@ def main():
     )
     parser.add_argument(
         "--random_seed", type=int, default=42,
-        help="Random seed for reproducible control placement. Default: 42."
+        help="Random seed for reproducible control placement. Each accession gets a "
+             "unique deterministic seed derived from this value. Default: 42."
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -437,24 +472,22 @@ def main():
     else:
         results = [func(region) for region in regions]
 
-    # Capture inside/outside counts from valid (non-error) results before filtering.
-    # These counts are boundary_type-independent (geometric overlap, not boundary distance).
-    valid_before = [r for r in results if not r['error']]
-    n_inside  = sum(1 for r in valid_before if r.get('is_inside_gene'))
-    n_outside = len(valid_before) - n_inside
+    # Capture counts from all valid (non-error) results before any filtering.
+    # location classification is boundary_type-independent (geometric overlap).
+    valid_before  = [r for r in results if not r['error']]
+    n_inside      = sum(1 for r in valid_before if r.get('location') == 'inside')
+    n_partial     = sum(1 for r in valid_before if r.get('location') == 'partial')
+    n_unannotated = sum(1 for r in valid_before
+                        if r.get('location') == 'intergenic'
+                        and r.get('up_dist') is None
+                        and r.get('down_dist') is None)
+    n_outside     = len(valid_before) - n_inside - n_partial - n_unannotated
 
-    # Filter out alignments that overlap a gene body
-    n_before = len(results)
-    results = [r for r in results if not r.get('is_inside_gene')]
-    n_removed = n_before - len(results)
-    if n_removed:
-        print(f"Filtered out {n_removed} result(s) where alignment overlaps a gene body.")
-
+    # Write full CSV BEFORE filtering — all rows preserved with location values intact
     csv_out_path = output_dir / args.csv_out
-    dist_out_path = output_dir / args.dist_out
     with open(csv_out_path, "w", newline="") as outcsv:
         fieldnames = [
-            "accession", "query", "is_reverse", "is_inside_gene",
+            "accession", "query", "is_reverse", "location",
             "seq_start", "seq_end", "align_start", "align_end",
             "which_boundary_used", "boundary_used",
             "up_gene", "up_boundary", "up_dist",
@@ -466,7 +499,6 @@ def main():
         for r in results:
             writer.writerow(r)
 
-<<<<<<< HEAD
     # Filter 1: alignment fully inside a gene body
     n_before = len(results)
     results_filtered = [r for r in results if r.get('location') != 'inside']
@@ -485,12 +517,10 @@ def main():
 
     # dist CSV uses filtered results (intergenic + partial only)
     dist_out_path = output_dir / args.dist_out
-=======
->>>>>>> parent of 05c29cf (Added accounting for partial overlaps)
     with open(dist_out_path, "w", newline="") as dcsv:
         writer = csv.writer(dcsv)
         writer.writerow(["up_dist", "down_dist"])
-        for r in results:
+        for r in results_filtered:
             if r['error']:
                 continue
             writer.writerow([r['up_dist'], r['down_dist']])
@@ -499,25 +529,25 @@ def main():
         plot_stem   = Path(args.plot_name).stem
         plot_suffix = Path(args.plot_name).suffix or ".png"
 
-<<<<<<< HEAD
         # --- Plot 1: distance distribution with random control overlay ---
         ups   = [float(r['up_dist'])   for r in results_filtered if r.get('up_dist')   is not None and not r.get('error')]
         downs = [float(r['down_dist']) for r in results_filtered if r.get('down_dist') is not None and not r.get('error')]
 
-        # Generate random controls; runs per-genome so may take time for large datasets
+        # Generate random controls, parallelised across accessions via --nproc
         rand_ups, rand_downs = [], []
         if args.n_random > 0:
-            print(f"Generating random controls ({args.n_random} placements per genome)...")
+            print(f"Generating random controls ({args.n_random} placements per genome, "
+                  f"nproc={args.nproc})...")
             rand_ups, rand_downs = run_random_controls(
-                results_filtered, args.genbank_dir, args.gb_naming,
-                args.boundary_type, args.n_random, args.random_seed,
+                results_filtered,
+                args.genbank_dir,
+                args.gb_naming,
+                args.boundary_type,
+                args.n_random,
+                args.random_seed,
+                nproc=args.nproc,
                 verbose=args.verbose
             )
-=======
-        # --- Plot 1: distance distribution (intergenic results only) ---
-        ups   = [float(r['up_dist'])   for r in results if r['up_dist']   is not None and not r['error']]
-        downs = [float(r['down_dist']) for r in results if r['down_dist'] is not None and not r['error']]
->>>>>>> parent of 05c29cf (Added accounting for partial overlaps)
 
         if not ups and not downs:
             print("Warning: no valid upstream/downstream distances to plot. Skipping distance plot.")
@@ -525,7 +555,7 @@ def main():
             fig1, ax1 = plt.subplots()
 
             # Use density when random controls are present so distributions with
-            # different sample sizes (n_real vs n_random) are directly comparable
+            # different sample sizes are directly comparable on the same y-axis.
             use_density = bool(rand_ups or rand_downs)
 
             if args.xlim is not None:
@@ -543,7 +573,7 @@ def main():
             if downs:
                 ax1.hist(downs, **hist_kwargs, alpha=0.7, label="Downstream (real)",
                          density=use_density)
-            # Random controls plotted as step outlines so they don't obscure real bars
+            # Random controls as step outlines so they don't obscure real bars
             if rand_ups:
                 ax1.hist(rand_ups,   **hist_kwargs, alpha=0.9, label="Upstream (random)",
                          density=use_density, histtype='step', linewidth=1.5, linestyle='--')
@@ -566,16 +596,13 @@ def main():
             if args.verbose:
                 print(f"Distance plot saved: {(output_dir / args.plot_name).resolve()}")
 
-        # --- Plot 2: inside gene vs intergenic counts ---
+        # --- Plot 2: location category counts (all valid results, pre-filter) ---
         fig2, ax2 = plt.subplots()
-        bars = ax2.bar(
-            ['Inside gene', 'Intergenic'],
-            [n_inside, n_outside],
-            alpha=0.7
-        )
-        # Annotate each bar with its count
-        y_offset = max(n_inside, n_outside) * 0.01 if max(n_inside, n_outside) > 0 else 0.5
-        for bar, count in zip(bars, [n_inside, n_outside]):
+        labels = ['Inside gene', 'Partial overlap', 'Intergenic', 'Unannotated']
+        counts = [n_inside, n_partial, n_outside, n_unannotated]
+        bars = ax2.bar(labels, counts, alpha=0.7)
+        y_offset = max(counts) * 0.01 if max(counts) > 0 else 0.5
+        for bar, count in zip(bars, counts):
             ax2.text(
                 bar.get_x() + bar.get_width() / 2,
                 bar.get_height() + y_offset,
@@ -585,11 +612,11 @@ def main():
         ax2.set_ylabel("Count")
         ax2.set_title(f"Alignment location ({os.path.basename(args.fasta)})")
         fig2.tight_layout()
-        loc_plot_name = f"{plot_stem}_inside_vs_intergenic{plot_suffix}"
+        loc_plot_name = f"{plot_stem}_location{plot_suffix}"
         fig2.savefig(output_dir / loc_plot_name)
         plt.close(fig2)
         if args.verbose:
-            print(f"Inside/intergenic plot saved: {(output_dir / loc_plot_name).resolve()}")
+            print(f"Location plot saved: {(output_dir / loc_plot_name).resolve()}")
 
 
 if __name__ == "__main__":
