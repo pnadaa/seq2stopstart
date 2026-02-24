@@ -3,6 +3,8 @@
 import argparse
 import os
 from pathlib import Path
+from collections import defaultdict
+import numpy as np
 from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
@@ -142,6 +144,98 @@ def classify_alignment(align_start: int, align_end: int, genes: List[Dict[str, A
         if align_start >= g['start'] and align_end <= g['end']:
             return 'inside'
     return 'partial'
+
+
+def run_random_controls(
+    results_filtered: List[Dict[str, Any]],
+    genbank_dir: str,
+    gb_naming: str,
+    boundary_type: str,
+    n_random: int,
+    seed: int,
+    verbose: bool = False
+) -> tuple[List[float], List[float]]:
+    """
+    For each unique accession in results_filtered, randomly place n_random
+    sequences across the genome. Sequence lengths are sampled from the real
+    alignment lengths for that accession, preserving the observed length
+    distribution. Applies the same inside-gene and unannotated filters as the
+    real pipeline so the null and real distributions are directly comparable.
+    Returns (random_ups, random_downs).
+    """
+    rng = np.random.default_rng(seed)
+
+    # Collect alignment lengths per accession from real filtered results
+    accession_lengths = defaultdict(list)
+    for r in results_filtered:
+        if not r.get('error') and r.get('align_start') is not None and r.get('align_end') is not None:
+            length = r['align_end'] - r['align_start']
+            if length > 0:
+                accession_lengths[r['accession']].append(length)
+
+    random_ups = []
+    random_downs = []
+
+    for accession, lengths in accession_lengths.items():
+        gb_path = (
+            Path(genbank_dir) / f"{accession}.gbff"
+            if gb_naming == "accession"
+            else Path(genbank_dir) / gb_naming.format(accession=accession)
+        )
+        if not gb_path.exists():
+            print(f"Warning: GenBank file not found for {accession}, skipping random control.")
+            continue
+
+        record = next(SeqIO.parse(gb_path, "genbank"))
+        genome_length = len(record.seq)
+        genes = extract_genes_with_boundary(record, boundary_type)
+
+        if verbose:
+            print(f"Generating {n_random} random placements for {accession} "
+                  f"(genome length: {genome_length:,} bp)")
+
+        placed = 0
+        attempts = 0
+        max_attempts = n_random * 20
+
+        while placed < n_random and attempts < max_attempts:
+            attempts += 1
+            length = int(rng.choice(lengths))
+            if length >= genome_length:
+                continue
+            rand_start = int(rng.integers(0, genome_length - length))
+            rand_end = rand_start + length
+
+            # Apply same geometric filter as real pipeline
+            location = classify_alignment(rand_start, rand_end, genes)
+            if location == 'inside':
+                continue
+
+            up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
+            up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes)
+
+            distances = [
+                ("start", rand_start, up_s, up_d_s, down_s, down_d_s),
+                ("end",   rand_end,   up_e, up_d_e, down_e, down_d_e)
+            ]
+            min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
+            _, _, up_gene, up_dist, down_gene, down_dist = min_tuple
+
+            # Apply same unannotated filter as real pipeline
+            if up_dist is None and down_dist is None:
+                continue
+
+            if up_dist is not None:
+                random_ups.append(float(up_dist))
+            if down_dist is not None:
+                random_downs.append(float(down_dist))
+            placed += 1
+
+        if placed < n_random:
+            print(f"Warning: only placed {placed}/{n_random} random sequences for "
+                  f"{accession} after {max_attempts} attempts.")
+
+    return random_ups, random_downs
 
 
 def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False) -> Dict[str, Any]:
@@ -300,13 +394,23 @@ def main():
     parser.add_argument("--plot", action="store_true")
     parser.add_argument(
         "--plot_name", default="distance_distribution.png",
-        help="Filename for the distance distribution plot (default: distance_distribution.png). "
+        help="Filename for the distance distribution plot. "
              "The location category plot is saved with '_location' appended to the stem."
     )
     parser.add_argument(
         "--xlim", type=float, nargs=2, metavar=("XMIN", "XMAX"), default=None,
         help="Limit the x-axis of the distance plot, e.g. --xlim 0 500. "
-             "If omitted, matplotlib autoscales. Bar widths and ticks scale to this range."
+             "Bar widths and ticks scale to this range."
+    )
+    parser.add_argument(
+        "--n_random", type=int, default=1000,
+        help="Number of random sequence placements per genome for the null distribution "
+             "control. Lengths are sampled from real alignment lengths for that genome. "
+             "Set to 0 to disable. Default: 1000."
+    )
+    parser.add_argument(
+        "--random_seed", type=int, default=42,
+        help="Random seed for reproducible control placement. Default: 42."
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -372,7 +476,7 @@ def main():
     if n_removed:
         print(f"Filtered out {n_removed} result(s) where alignment is fully inside a gene body.")
 
-    # Filter 2: unannotated regions (intergenic classification but no flanking genes found, no error)
+    # Filter 2: unannotated regions (intergenic classification but no flanking genes, no error)
     n_before = len(results_filtered)
     results_filtered = [r for r in results_filtered
                         if r.get('error')
@@ -395,35 +499,58 @@ def main():
         plot_stem   = Path(args.plot_name).stem
         plot_suffix = Path(args.plot_name).suffix or ".png"
 
-        # --- Plot 1: distance distribution (filtered results only) ---
-        ups   = [float(r['up_dist'])   for r in results_filtered if r['up_dist']   is not None and not r['error']]
-        downs = [float(r['down_dist']) for r in results_filtered if r['down_dist'] is not None and not r['error']]
+        # --- Plot 1: distance distribution with random control overlay ---
+        ups   = [float(r['up_dist'])   for r in results_filtered if r.get('up_dist')   is not None and not r.get('error')]
+        downs = [float(r['down_dist']) for r in results_filtered if r.get('down_dist') is not None and not r.get('error')]
+
+        # Generate random controls; runs per-genome so may take time for large datasets
+        rand_ups, rand_downs = [], []
+        if args.n_random > 0:
+            print(f"Generating random controls ({args.n_random} placements per genome)...")
+            rand_ups, rand_downs = run_random_controls(
+                results_filtered, args.genbank_dir, args.gb_naming,
+                args.boundary_type, args.n_random, args.random_seed,
+                verbose=args.verbose
+            )
 
         if not ups and not downs:
             print("Warning: no valid upstream/downstream distances to plot. Skipping distance plot.")
         else:
             fig1, ax1 = plt.subplots()
+
+            # Use density when random controls are present so distributions with
+            # different sample sizes (n_real vs n_random) are directly comparable
+            use_density = bool(rand_ups or rand_downs)
+
             if args.xlim is not None:
                 xmin, xmax = float(args.xlim[0]), float(args.xlim[1])
-                # Cap bins at integer span so bin width never drops below 1 bp
                 n_bins = min(40, int(xmax - xmin))
                 hist_kwargs = {'bins': n_bins, 'range': (xmin, xmax)}
             else:
-                all_vals = ups + downs
+                all_vals = ups + downs + rand_ups + rand_downs
                 n_bins = min(40, int(max(all_vals) - min(all_vals)))
                 hist_kwargs = {'bins': n_bins}
 
             if ups:
-                ax1.hist(ups,   **hist_kwargs, alpha=0.7, label="Upstream")
+                ax1.hist(ups,   **hist_kwargs, alpha=0.7, label="Upstream (real)",
+                         density=use_density)
             if downs:
-                ax1.hist(downs, **hist_kwargs, alpha=0.7, label="Downstream")
+                ax1.hist(downs, **hist_kwargs, alpha=0.7, label="Downstream (real)",
+                         density=use_density)
+            # Random controls plotted as step outlines so they don't obscure real bars
+            if rand_ups:
+                ax1.hist(rand_ups,   **hist_kwargs, alpha=0.9, label="Upstream (random)",
+                         density=use_density, histtype='step', linewidth=1.5, linestyle='--')
+            if rand_downs:
+                ax1.hist(rand_downs, **hist_kwargs, alpha=0.9, label="Downstream (random)",
+                         density=use_density, histtype='step', linewidth=1.5, linestyle='--')
 
             if args.xlim is not None:
                 ax1.set_xlim(xmin, xmax)
                 ax1.xaxis.set_major_locator(MaxNLocator(nbins=10, steps=[1, 2, 5, 10]))
 
             ax1.set_xlabel(f"Distance to {args.boundary_type} codon (bp)")
-            ax1.set_ylabel("Count")
+            ax1.set_ylabel("Density" if use_density else "Count")
             ax1.set_title(f"{args.boundary_type.capitalize()} distance distribution "
                           f"({os.path.basename(args.fasta)})")
             ax1.legend()
