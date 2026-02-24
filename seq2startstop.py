@@ -271,6 +271,10 @@ def main():
     parser.add_argument("--plot_name", default="distance_distribution.png",
                         help="File name for the plot image (default: distance_distribution.png)")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+    "--xlim", type=float, nargs=2, metavar=("XMIN", "XMAX"), default=None,
+    help="Limit the x-axis of the distance plot, e.g. --xlim 0 500. "
+         "If omitted, matplotlib autoscales.")
     args = parser.parse_args()
 
     print("\nArguments used:")
@@ -327,17 +331,26 @@ def main():
     if args.plot:
         ups   = [float(r['up_dist'])   for r in results if r['up_dist']   is not None and not r['error']]
         downs = [float(r['down_dist']) for r in results if r['down_dist'] is not None and not r['error']]
-        plot_title = f"{args.boundary_type.capitalize()} distance distribution ({os.path.basename(args.fasta)})"
-        plt.hist(ups,   bins=40, alpha=0.7, label="Upstream")
-        plt.hist(downs, bins=40, alpha=0.7, label="Downstream")
-        plt.xlabel(f"Distance to {args.boundary_type} codon (bp)")
-        plt.ylabel("Count")
-        plt.title(plot_title)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(output_dir / args.plot_name)
-        if args.verbose:
-            print(f"Plot saved: {(output_dir / args.plot_name).resolve()}")
+
+        if not ups and not downs:
+            print("Warning: no valid upstream/downstream distances to plot. Skipping plot.")
+        else:
+            plot_title = f"{args.boundary_type.capitalize()} distance distribution ({os.path.basename(args.fasta)})"
+            if ups:
+                plt.hist(ups,   bins=40, alpha=0.7, label="Upstream")
+            if downs:
+                plt.hist(downs, bins=40, alpha=0.7, label="Downstream")
+            plt.xlabel(f"Distance to {args.boundary_type} codon (bp)")
+            plt.ylabel("Count")
+            plt.title(plot_title)
+            if args.xlim is not None:
+                plt.xlim(args.xlim[0], args.xlim[1])
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(output_dir / args.plot_name)
+            if args.verbose:
+                print(f"Plot saved: {(output_dir / args.plot_name).resolve()}")
+
 
 
 if __name__ == "__main__":
