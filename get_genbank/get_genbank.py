@@ -42,6 +42,11 @@ def parse_arguments():
         required=False,
         help="NCBI API key to increase your Entrez rate limit (optional)."
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip accessions whose .gbff file already exists in the output directory."
+    )
     return parser.parse_args()
 
 def get_accessions_from_fasta(fasta_path):
@@ -90,7 +95,10 @@ def fetch_entrez_genbank(accession, output_dir, email, api_key=None, max_retries
             return f"Error: Entrez exception for {accession}: {str(e)}"
     return f"Error: Both methods failed for {accession}: Too Many Requests after retries."
 
-def download_worker(accession, output_dir, email, api_key=None):
+def download_worker(accession, output_dir, email, api_key=None, resume=False):
+    final_output_path = os.path.join(output_dir, f"{accession}.gbff")
+    if resume and os.path.exists(final_output_path):
+        return f"Skipped (already exists): {accession}"
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_filename = os.path.join(temp_dir, f"{accession}.zip")
         cmd = [
@@ -140,7 +148,7 @@ def main():
     print(f"Found {len(accessions)} unique accessions. Starting parallel download with {args.threads} threads...")
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_to_acc = {
-            executor.submit(download_worker, acc, args.output, args.email, api_key): acc
+            executor.submit(download_worker, acc, args.output, args.email, api_key, args.resume): acc
             for acc in accessions
         }
         for future in as_completed(future_to_acc):
