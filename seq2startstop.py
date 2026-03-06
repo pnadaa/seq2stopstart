@@ -155,12 +155,19 @@ def _random_one_accession(
     n_random: int,
     seed: int,
     verbose: bool = False
-) -> tuple[List[float], List[float]]:
+) -> tuple[List[float], List[float], Dict[str, int]]:
     """
     Randomly place n_random sequences of sampled lengths within one genome.
     Each accession receives a deterministic but unique seed derived from the
     global seed so results are reproducible regardless of process order.
     Applies the same inside-gene and unannotated filters as the real pipeline.
+
+    Returns (rand_ups, rand_downs, counts) where counts tracks every valid
+    placement attempt by location category for use in Plot 2b.
+      counts['inside']     – rejected: fell fully inside a gene
+      counts['partial']    – accepted: partially overlapped a gene
+      counts['intergenic'] – accepted: fully intergenic and annotated
+      counts['unannotated']– rejected: intergenic but no flanking genes found
     """
     rng = np.random.default_rng(seed)
 
@@ -171,7 +178,7 @@ def _random_one_accession(
     )
     if not gb_path.exists():
         print(f"Warning: GenBank file not found for {accession}, skipping random control.")
-        return [], []
+        return [], [], {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
 
     record = next(SeqIO.parse(gb_path, "genbank"))
     genome_length = len(record.seq)
@@ -182,6 +189,7 @@ def _random_one_accession(
               f"(genome length: {genome_length:,} bp)")
 
     rand_ups, rand_downs = [], []
+    counts = {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
     placed = 0
     attempts = 0
     max_attempts = n_random * 20
@@ -194,9 +202,9 @@ def _random_one_accession(
         rand_start = int(rng.integers(0, genome_length - length))
         rand_end = rand_start + length
 
-        # Apply same geometric filter as real pipeline
         location = classify_alignment(rand_start, rand_end, genes)
         if location == 'inside':
+            counts['inside'] += 1
             continue
 
         up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
@@ -208,10 +216,12 @@ def _random_one_accession(
         min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
         _, _, up_gene, up_dist, down_gene, down_dist = min_tuple
 
-        # Apply same unannotated filter as real pipeline
         if up_dist is None and down_dist is None:
+            counts['unannotated'] += 1
             continue
 
+        # Accepted placement — record location and distances
+        counts[location] += 1   # 'partial' or 'intergenic'
         if up_dist is not None:
             rand_ups.append(float(up_dist))
         if down_dist is not None:
@@ -222,7 +232,7 @@ def _random_one_accession(
         print(f"Warning: only placed {placed}/{n_random} random sequences for "
               f"{accession} after {max_attempts} attempts.")
 
-    return rand_ups, rand_downs
+    return rand_ups, rand_downs, counts
 
 
 def run_random_controls(
@@ -234,12 +244,13 @@ def run_random_controls(
     seed: int,
     nproc: int = 1,
     verbose: bool = False
-) -> tuple[List[float], List[float]]:
+) -> tuple[List[float], List[float], Dict[str, int]]:
     """
     Collects alignment lengths per accession from filtered real results, then
     dispatches per-accession random placement to _random_one_accession.
     Parallelised across accessions using the same --nproc as the real pipeline.
     Each accession gets a unique deterministic seed (seed + accession_index).
+    Returns (rand_ups, rand_downs, aggregated_counts).
     """
     accession_lengths: Dict[str, List[int]] = defaultdict(list)
     for r in results_filtered:
@@ -248,8 +259,8 @@ def run_random_controls(
             if length > 0:
                 accession_lengths[r['accession']].append(length)
 
-    # Build task list with per-accession seeds: seed+i ensures reproducibility
-    # regardless of which worker handles which accession.
+    # Per-accession seeds: seed+i ensures reproducibility regardless of
+    # which worker process handles which accession.
     tasks = [
         (acc, lengths, genbank_dir, gb_naming, boundary_type, n_random, seed + i, verbose)
         for i, (acc, lengths) in enumerate(accession_lengths.items())
@@ -261,9 +272,15 @@ def run_random_controls(
     else:
         per_accession = [_random_one_accession(*t) for t in tasks]
 
-    rand_ups   = [v for ups, _    in per_accession for v in ups]
-    rand_downs = [v for _,  downs in per_accession for v in downs]
-    return rand_ups, rand_downs
+    rand_ups   = [v for ups, _, _   in per_accession for v in ups]
+    rand_downs = [v for _, downs, _ in per_accession for v in downs]
+
+    agg_counts: Dict[str, int] = {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
+    for _, _, counts in per_accession:
+        for k in agg_counts:
+            agg_counts[k] += counts[k]
+
+    return rand_ups, rand_downs, agg_counts
 
 
 def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False) -> Dict[str, Any]:
@@ -423,13 +440,16 @@ def main():
     parser.add_argument("--plot", action="store_true")
     parser.add_argument(
         "--plot_name", default="distance_distribution.png",
-        help="Filename for the distance distribution plot. "
-             "The location category plot is saved with '_location' appended to the stem."
+        help="Filename stem for distance distribution plots. "
+             "Real data: {stem}.png. Random control: {stem}_random.png. "
+             "Overlay (--overlay): {stem}_overlay.png. "
+             "Location plots: {stem}_location.png and {stem}_location_random.png."
     )
     parser.add_argument(
         "--xlim", type=float, nargs=2, metavar=("XMIN", "XMAX"), default=None,
-        help="Limit the x-axis of the distance plot, e.g. --xlim 0 500. "
-             "Bar widths and ticks scale to this range."
+        help="Limit the x-axis of all distance plots, e.g. --xlim 0 500. "
+             "Bar widths and ticks scale to this range. Applied independently "
+             "to each separate plot, and to the overlay when --overlay is set."
     )
     parser.add_argument(
         "--n_random", type=int, default=1000,
@@ -441,6 +461,13 @@ def main():
         "--random_seed", type=int, default=42,
         help="Random seed for reproducible control placement. Each accession gets a "
              "unique deterministic seed derived from this value. Default: 42."
+    )
+    parser.add_argument(
+        "--overlay", action="store_true",
+        help="When set, produce a single overlay plot of real vs random distributions "
+             "using density on the y-axis and step outlines for the random control, "
+             "instead of two separate count-based plots. "
+             "Saves as {stem}_overlay.png instead of {stem}.png + {stem}_random.png."
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -529,16 +556,17 @@ def main():
         plot_stem   = Path(args.plot_name).stem
         plot_suffix = Path(args.plot_name).suffix or ".png"
 
-        # --- Plot 1: distance distribution with random control overlay ---
         ups   = [float(r['up_dist'])   for r in results_filtered if r.get('up_dist')   is not None and not r.get('error')]
         downs = [float(r['down_dist']) for r in results_filtered if r.get('down_dist') is not None and not r.get('error')]
 
         # Generate random controls, parallelised across accessions via --nproc
-        rand_ups, rand_downs = [], []
+        rand_ups: List[float] = []
+        rand_downs: List[float] = []
+        rand_counts: Dict[str, int] = {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
         if args.n_random > 0:
             print(f"Generating random controls ({args.n_random} placements per genome, "
                   f"nproc={args.nproc})...")
-            rand_ups, rand_downs = run_random_controls(
+            rand_ups, rand_downs, rand_counts = run_random_controls(
                 results_filtered,
                 args.genbank_dir,
                 args.gb_naming,
@@ -549,66 +577,134 @@ def main():
                 verbose=args.verbose
             )
 
-        if not ups and not downs:
-            print("Warning: no valid upstream/downstream distances to plot. Skipping distance plot.")
-        else:
-            fig1, ax1 = plt.subplots()
+        # --- Shared helpers (defined here so they close over args.xlim) ---
 
-            # Use density when random controls are present so distributions with
-            # different sample sizes are directly comparable on the same y-axis.
-            use_density = bool(rand_ups or rand_downs)
-
+        def _make_hist_kwargs(vals: List[float]) -> dict:
+            """
+            Compute bins and range independently from the supplied data.
+            When --xlim is set, all plots use the same visible window but
+            each still derives its bin count from that window independently.
+            When --xlim is not set, bins are computed from each dataset's
+            own range, keeping the real and random plots fully independent.
+            """
             if args.xlim is not None:
                 xmin, xmax = float(args.xlim[0]), float(args.xlim[1])
-                n_bins = min(40, int(xmax - xmin))
-                hist_kwargs = {'bins': n_bins, 'range': (xmin, xmax)}
-            else:
-                all_vals = ups + downs + rand_ups + rand_downs
-                n_bins = min(40, int(max(all_vals) - min(all_vals)))
-                hist_kwargs = {'bins': n_bins}
+                n_bins = min(100, int(xmax - xmin))
+                return {'bins': n_bins, 'range': (xmin, xmax)}
+            if not vals:
+                return {'bins': 100}
+            span = int(max(vals) - min(vals))
+            return {'bins': min(100, span) if span > 0 else 1}
 
-            if ups:
-                ax1.hist(ups,   **hist_kwargs, alpha=0.7, label="Upstream (real)",
-                         density=use_density)
-            if downs:
-                ax1.hist(downs, **hist_kwargs, alpha=0.7, label="Downstream (real)",
-                         density=use_density)
-            # Random controls as step outlines so they don't obscure real bars
-            if rand_ups:
-                ax1.hist(rand_ups,   **hist_kwargs, alpha=0.9, label="Upstream (random)",
-                         density=use_density, histtype='step', linewidth=1.5, linestyle='--')
-            if rand_downs:
-                ax1.hist(rand_downs, **hist_kwargs, alpha=0.9, label="Downstream (random)",
-                         density=use_density, histtype='step', linewidth=1.5, linestyle='--')
-
+        def _apply_xlim_ticks(ax) -> None:
+            """Apply xlim and scaled ticks only when --xlim is explicitly set."""
             if args.xlim is not None:
-                ax1.set_xlim(xmin, xmax)
-                ax1.xaxis.set_major_locator(MaxNLocator(nbins=10, steps=[1, 2, 5, 10]))
+                ax.set_xlim(float(args.xlim[0]), float(args.xlim[1]))
+                ax.xaxis.set_major_locator(MaxNLocator(nbins=10, steps=[1, 2, 5, 10]))
 
-            ax1.set_xlabel(f"Distance to {args.boundary_type} codon (bp)")
-            ax1.set_ylabel("Density" if use_density else "Count")
-            ax1.set_title(f"{args.boundary_type.capitalize()} distance distribution "
-                          f"({os.path.basename(args.fasta)})")
-            ax1.legend()
-            fig1.tight_layout()
-            fig1.savefig(output_dir / args.plot_name)
-            plt.close(fig1)
-            if args.verbose:
-                print(f"Distance plot saved: {(output_dir / args.plot_name).resolve()}")
+        def _annotate_bars(ax, bars, counts):
+            y_offset = max(counts) * 0.01 if max(counts) > 0 else 0.5
+            for bar, count in zip(bars, counts):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + y_offset,
+                    str(count),
+                    ha='center', va='bottom'
+                )
 
-        # --- Plot 2: location category counts (all valid results, pre-filter) ---
+        # ---------------------------------------------------------------
+        # Distance plots — behaviour depends on --overlay
+        # ---------------------------------------------------------------
+
+        if args.overlay:
+            # ---- Plot 1 (overlay): real + random on one figure, density y-axis ----
+            # Bins computed from combined data so both distributions share the same grid.
+            if not (ups or downs) and not (rand_ups or rand_downs):
+                print("Warning: no distance data available. Skipping overlay plot.")
+            else:
+                combined = ups + downs + rand_ups + rand_downs
+                hk_ov = _make_hist_kwargs(combined)
+
+                fig_ov, ax_ov = plt.subplots()
+                if ups:
+                    ax_ov.hist(ups,   **hk_ov, alpha=0.7, density=True, label="Upstream (real)")
+                if downs:
+                    ax_ov.hist(downs, **hk_ov, alpha=0.7, density=True, label="Downstream (real)")
+                if rand_ups:
+                    ax_ov.hist(rand_ups,   **hk_ov, density=True, histtype='step',
+                               linewidth=1.5, linestyle='--', label="Upstream (random)")
+                if rand_downs:
+                    ax_ov.hist(rand_downs, **hk_ov, density=True, histtype='step',
+                               linewidth=1.5, linestyle='--', label="Downstream (random)")
+                _apply_xlim_ticks(ax_ov)
+                ax_ov.set_xlabel(f"Distance to {args.boundary_type} codon (bp)")
+                ax_ov.set_ylabel("Density")
+                ax_ov.set_title(f"{args.boundary_type.capitalize()} distance: real vs random "
+                                f"({os.path.basename(args.fasta)})")
+                ax_ov.legend()
+                fig_ov.tight_layout()
+                overlay_name = f"{plot_stem}_overlay{plot_suffix}"
+                fig_ov.savefig(output_dir / overlay_name)
+                plt.close(fig_ov)
+                if args.verbose:
+                    print(f"Overlay plot saved: {(output_dir / overlay_name).resolve()}")
+
+        else:
+            # ---- Plot 1a: real distance distribution (counts) ----
+            # Bins derived solely from real data; completely independent of random data.
+            if not ups and not downs:
+                print("Warning: no valid upstream/downstream distances to plot. Skipping real distance plot.")
+            else:
+                hk_real = _make_hist_kwargs(ups + downs)
+                fig1, ax1 = plt.subplots()
+                if ups:
+                    ax1.hist(ups,   **hk_real, alpha=0.7, label="Upstream")
+                if downs:
+                    ax1.hist(downs, **hk_real, alpha=0.7, label="Downstream")
+                _apply_xlim_ticks(ax1)
+                ax1.set_xlabel(f"Distance to {args.boundary_type} codon (bp)")
+                ax1.set_ylabel("Count")
+                ax1.set_title(f"{args.boundary_type.capitalize()} distance distribution "
+                              f"({os.path.basename(args.fasta)})")
+                ax1.legend()
+                fig1.tight_layout()
+                fig1.savefig(output_dir / args.plot_name)
+                plt.close(fig1)
+                if args.verbose:
+                    print(f"Real distance plot saved: {(output_dir / args.plot_name).resolve()}")
+
+            # ---- Plot 1b: random distance distribution (counts) ----
+            # Bins derived solely from random data; completely independent of real data.
+            if rand_ups or rand_downs:
+                hk_rand = _make_hist_kwargs(rand_ups + rand_downs)
+                fig_r, ax_r = plt.subplots()
+                if rand_ups:
+                    ax_r.hist(rand_ups,   **hk_rand, alpha=0.7, label="Upstream (random)")
+                if rand_downs:
+                    ax_r.hist(rand_downs, **hk_rand, alpha=0.7, label="Downstream (random)")
+                _apply_xlim_ticks(ax_r)
+                ax_r.set_xlabel(f"Distance to {args.boundary_type} codon (bp)")
+                ax_r.set_ylabel("Count")
+                ax_r.set_title(f"{args.boundary_type.capitalize()} random control distance distribution "
+                               f"({os.path.basename(args.fasta)})")
+                ax_r.legend()
+                fig_r.tight_layout()
+                rand_plot_name = f"{plot_stem}_random{plot_suffix}"
+                fig_r.savefig(output_dir / rand_plot_name)
+                plt.close(fig_r)
+                if args.verbose:
+                    print(f"Random distance plot saved: {(output_dir / rand_plot_name).resolve()}")
+
+        # ---------------------------------------------------------------
+        # Location plots — always separate, unaffected by --overlay
+        # ---------------------------------------------------------------
+
+        # ---- Plot 2a: real location category counts ----
         fig2, ax2 = plt.subplots()
-        labels = ['Inside gene', 'Partial overlap', 'Intergenic', 'Unannotated']
-        counts = [n_inside, n_partial, n_outside, n_unannotated]
-        bars = ax2.bar(labels, counts, alpha=0.7)
-        y_offset = max(counts) * 0.01 if max(counts) > 0 else 0.5
-        for bar, count in zip(bars, counts):
-            ax2.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + y_offset,
-                str(count),
-                ha='center', va='bottom'
-            )
+        loc_labels = ['Inside gene', 'Partial overlap', 'Intergenic', 'Unannotated']
+        real_counts = [n_inside, n_partial, n_outside, n_unannotated]
+        bars2 = ax2.bar(loc_labels, real_counts, alpha=0.7)
+        _annotate_bars(ax2, bars2, real_counts)
         ax2.set_ylabel("Count")
         ax2.set_title(f"Alignment location ({os.path.basename(args.fasta)})")
         fig2.tight_layout()
@@ -616,7 +712,29 @@ def main():
         fig2.savefig(output_dir / loc_plot_name)
         plt.close(fig2)
         if args.verbose:
-            print(f"Location plot saved: {(output_dir / loc_plot_name).resolve()}")
+            print(f"Real location plot saved: {(output_dir / loc_plot_name).resolve()}")
+
+        # ---- Plot 2b: random location category counts ----
+        # Shows the proportion of random placements falling in each category,
+        # including rejected placements, for comparison with the real data.
+        if any(rand_counts.values()):
+            fig2r, ax2r = plt.subplots()
+            rand_loc_counts = [
+                rand_counts['inside'],
+                rand_counts['partial'],
+                rand_counts['intergenic'],
+                rand_counts['unannotated']
+            ]
+            bars2r = ax2r.bar(loc_labels, rand_loc_counts, alpha=0.7)
+            _annotate_bars(ax2r, bars2r, rand_loc_counts)
+            ax2r.set_ylabel("Count")
+            ax2r.set_title(f"Random control alignment location ({os.path.basename(args.fasta)})")
+            fig2r.tight_layout()
+            loc_rand_name = f"{plot_stem}_location_random{plot_suffix}"
+            fig2r.savefig(output_dir / loc_rand_name)
+            plt.close(fig2r)
+            if args.verbose:
+                print(f"Random location plot saved: {(output_dir / loc_rand_name).resolve()}")
 
 
 if __name__ == "__main__":
