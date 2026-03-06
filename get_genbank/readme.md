@@ -49,6 +49,8 @@ The script requires you to provide an email address for NCBI-compliant Entrez ac
 
 -   **`-t`**, **`--threads`** : (Optional) Number of parallel download threads (default: 4)
 
+-   **`-r`**, **`--resume`** : (Optional) Skip genomes which have already been downloaded
+
 **Example:**
 
 

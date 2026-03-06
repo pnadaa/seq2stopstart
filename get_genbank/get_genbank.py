@@ -43,7 +43,7 @@ def parse_arguments():
         help="NCBI API key to increase your Entrez rate limit (optional)."
     )
     parser.add_argument(
-        "--resume",
+        "-r", "--resume",
         action="store_true",
         help="Skip accessions whose .gbff file already exists in the output directory."
     )
