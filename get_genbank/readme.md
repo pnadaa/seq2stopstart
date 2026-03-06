@@ -54,7 +54,7 @@ The script requires you to provide an email address for NCBI-compliant Entrez ac
 **Example:**
 
 
-`python fetch_genbank.py -i example_multifasta.fasta -o downloaded_gbffs -e your@email.com -t 8`
+`python fetch_genbank.py -i example_multifasta.fasta -o downloaded_gbffs -e your@email.com -t 8 -r`
 
 ## FASTA Header Format
 
