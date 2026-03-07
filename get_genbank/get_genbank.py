@@ -57,7 +57,7 @@ def get_accessions_from_fasta(fasta_path):
                 if line.startswith(">"):
                     header = line[1:].strip()
                     parts1 = header.rsplit('_', 1)
-                    parts2 = header.rsplit('-', 1)
+                    parts2 = header.rsplit(':', 1)
                     if len(parts1) == 2:
                         acc = parts1[0]
                         accessions.add(acc)
