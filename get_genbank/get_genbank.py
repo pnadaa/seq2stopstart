@@ -56,9 +56,13 @@ def get_accessions_from_fasta(fasta_path):
             for line in f:
                 if line.startswith(">"):
                     header = line[1:].strip()
-                    parts = header.rsplit('_', 1)
-                    if len(parts) == 2:
-                        acc = parts[0]
+                    parts1 = header.rsplit('_', 1)
+                    parts2 = header.rsplit('-', 1)
+                    if len(parts1) == 2:
+                        acc = parts1[0]
+                        accessions.add(acc)
+                    elif len(parts2) == 2:
+                        acc = parts2[0]
                         accessions.add(acc)
                     else:
                         print(f"Warning: Could not parse header format '{header}'. Skipping.")
