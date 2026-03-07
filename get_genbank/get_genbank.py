@@ -59,11 +59,9 @@ def get_accessions_from_fasta(fasta_path):
                     parts1 = header.rsplit('_', 1)
                     parts2 = header.rsplit(':', 1)
                     if len(parts1) == 2:
-                        acc = parts1[0]
-                        accessions.add(acc)
+                        accessions.add(parts1[0])
                     elif len(parts2) == 2:
-                        acc = parts2[0]
-                        accessions.add(acc)
+                        accessions.add(parts2[0])
                     else:
                         print(f"Warning: Could not parse header format '{header}'. Skipping.")
     except FileNotFoundError:
@@ -71,38 +69,62 @@ def get_accessions_from_fasta(fasta_path):
         exit(1)
     return list(accessions)
 
-def fetch_entrez_genbank(accession, output_dir, email, api_key=None, max_retries=3, retry_wait=60, sleep_interval=0.34):
+
+def fetch_entrez_genbank(accession, output_dir, email, api_key=None,
+                         sleep_interval=0.34, error_file=None):
+    """
+    Attempt to fetch a GenBank record via Entrez efetch.
+    Retries on ANY error up to 5 total attempts, waiting 1/3/5/7 s between them.
+    On final failure, appends the accession + reason to error_file (if provided).
+    """
     Entrez.email = email
     if api_key:
         Entrez.api_key = api_key
-        sleep_interval = 0.12  # Can do up to 10 req/sec with API key
+        sleep_interval = 0.12  # up to 10 req/s with API key
 
-    retries = 0
-    while retries < max_retries:
+    max_attempts = 5
+    last_error = "Unknown error"
+
+    for attempt in range(max_attempts):
         try:
             handle = Entrez.efetch(db="nucleotide", id=accession, rettype="gb", retmode="text")
             record = handle.read()
             handle.close()
             out_path = os.path.join(output_dir, f"{accession}.gbff")
-            with open(out_path, "w") as out_handle:
-                out_handle.write(record)
-            time.sleep(sleep_interval)  # Enforce rate limit
+            with open(out_path, "w") as fh:
+                fh.write(record)
+            time.sleep(sleep_interval)
             return f"Success (Entrez): {accession}"
-        except HTTPError as err:
-            if err.code == 429:
-                print(f"Rate limit hit for {accession}. Waiting {retry_wait} seconds...")
-                time.sleep(retry_wait)
-                retries += 1
-            else:
-                return f"Error: HTTP Error for {accession}: {str(err)}"
-        except Exception as e:
-            return f"Error: Entrez exception for {accession}: {str(e)}"
-    return f"Error: Both methods failed for {accession}: Too Many Requests after retries."
 
-def download_worker(accession, output_dir, email, api_key=None, resume=False):
+        except HTTPError as err:
+            last_error = f"HTTP Error {err.code}: {err.reason}"
+        except Exception as e:
+            last_error = str(e)
+
+        # Don't sleep after the final attempt
+        if attempt < max_attempts - 1:
+            wait = RETRY_WAITS[attempt]
+            print(f"  Entrez attempt {attempt + 1}/{max_attempts} failed for {accession} "
+                  f"({last_error}). Retrying in {wait}s...")
+            time.sleep(wait)
+
+    # All attempts exhausted — write to error file
+    final_msg = f"Error: All {max_attempts} Entrez attempts failed for {accession}: {last_error}"
+    if error_file:
+        with open(error_file, "a") as ef:
+            ef.write(f"{accession}\t{last_error}\n")
+    return final_msg
+
+
+def download_worker(accession, output_dir, email, api_key=None, resume=False, error_file=None):
     final_output_path = os.path.join(output_dir, f"{accession}.gbff")
     if resume and os.path.exists(final_output_path):
         return f"Skipped (already exists): {accession}"
+
+    # Bypass CLI for nucleotide accessions — datasets CLI expects GCA_/GCF_
+    if not (accession.startswith("GCA_") or accession.startswith("GCF_")):
+        return fetch_entrez_genbank(accession, output_dir, email, api_key, error_file=error_file)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         zip_filename = os.path.join(temp_dir, f"{accession}.zip")
         cmd = [
@@ -122,7 +144,6 @@ def download_worker(accession, output_dir, email, api_key=None, resume=False):
                             found_file = os.path.join(root, file)
                             break
                 if found_file:
-                    final_output_path = os.path.join(output_dir, f"{accession}.gbff")
                     shutil.move(found_file, final_output_path)
                     return f"Success: {accession}"
                 else:
@@ -134,31 +155,43 @@ def download_worker(accession, output_dir, email, api_key=None, resume=False):
         except Exception as e:
             print(f"Error: Datasets CLI exception for {accession}: {str(e)}. Retrying with Entrez efetch...")
 
-        # Fallback to Entrez with retry and rate limiting
-        return fetch_entrez_genbank(accession, output_dir, email, api_key)
+    # Fallback to Entrez with retry logic
+    return fetch_entrez_genbank(accession, output_dir, email, api_key,
+                                error_file=error_file)
+
 
 def main():
     args = parse_arguments()
     if not shutil.which("datasets"):
         print("Error: 'datasets' CLI tool not found in PATH. Please install NCBI Datasets CLI.")
         exit(1)
+
     os.makedirs(args.output, exist_ok=True)
+    error_file = os.path.join(args.output, "failed_accessions.tsv")
+
     print(f"Reading accessions from {args.input}...")
     accessions = get_accessions_from_fasta(args.input)
     if not accessions:
         print("No valid accessions found. Exiting.")
         exit(0)
+
     api_key = args.api_key if args.api_key else None
     print(f"Found {len(accessions)} unique accessions. Starting parallel download with {args.threads} threads...")
+    print(f"Failed accessions will be logged to: {error_file}")
+
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         future_to_acc = {
-            executor.submit(download_worker, acc, args.output, args.email, api_key, args.resume): acc
+            executor.submit(download_worker, acc, args.output, args.email,
+                            api_key, args.resume, error_file): acc
             for acc in accessions
         }
         for future in as_completed(future_to_acc):
-            result = future.result()
-            print(result)
+            print(future.result())
+
     print(f"\nProcessing complete. Files saved to: {args.output}")
+    if os.path.exists(error_file):
+        print(f"Some accessions failed — see: {error_file}")
+
 
 if __name__ == "__main__":
     main()
