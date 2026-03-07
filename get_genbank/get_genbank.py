@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from Bio import Entrez
 from urllib.error import HTTPError
 
+RETRY_WAITS = [1, 3, 5, 7]
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Parse multifasta headers, download GenBank files via NCBI Datasets CLI, with Entrez fallback and rate limiting."
