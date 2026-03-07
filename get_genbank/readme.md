@@ -64,6 +64,11 @@ Headers should look like:
 `>CP043804_723996-724438
 >NZ_LN831024_12345-67890`
 
+or
+
+`>CP043804:723996-724438
+>NZ_LN831024:12345-67890`
+
 The script extracts **`CP043804`** and **`NZ_LN831024`** as accessions.
 
 ## How it works
