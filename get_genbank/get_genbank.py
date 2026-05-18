@@ -58,12 +58,12 @@ def get_accessions_from_fasta(fasta_path):
             for line in f:
                 if line.startswith(">"):
                     header = line[1:].strip()
-                    parts1 = header.rsplit('_', 1)
-                    parts2 = header.rsplit(':', 1)
-                    if len(parts1) == 2:
-                        accessions.add(parts1[0])
-                    elif len(parts2) == 2:
-                        accessions.add(parts2[0])
+                    # Prefer ':' as the coordinate separator since '_' can occur
+                    # inside accessions (e.g. NZ_123:100-200).
+                    if ':' in header:
+                        accessions.add(header.rsplit(':', 1)[0])
+                    elif '_' in header:
+                        accessions.add(header.rsplit('_', 1)[0])
                     else:
                         print(f"Warning: Could not parse header format '{header}'. Skipping.")
     except FileNotFoundError:

@@ -58,16 +58,23 @@ The script requires you to provide an email address for NCBI-compliant Entrez ac
 
 ## FASTA Header Format
 
-Headers should look like:
+The script accepts three header styles:
 
+1.  Underscore between accession and coordinates:
 
-`>CP043804_723996-724438
->NZ_LN831024_12345-67890`
+    `>CP043804_723996-724438`
 
-or
+2.  Colon between accession and coordinates:
 
-`>CP043804:723996-724438
->NZ_LN831024:12345-67890`
+    `>CP043804:723996-724438`
+
+3.  Colon between accession and coordinates, where the accession itself contains an underscore:
+
+    `>NZ_LN831024:12345-67890`
+
+Parsing prefers **`:`** as the coordinate separator when present, so accessions
+that contain underscores (e.g. **`NZ_LN831024`**) are preserved. If no **`:`**
+is in the header, the script falls back to splitting on the last **`_`**.
 
 The script extracts **`CP043804`** and **`NZ_LN831024`** as accessions.
 
