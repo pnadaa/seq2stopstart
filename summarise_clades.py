@@ -588,6 +588,10 @@ directory. They are properties of the input data, not of the pipeline.
    dropped — true intergenic targets included — and its codons sat at the
    genome ends. On circular records, distances now also wrap the origin.
    `comparison_location_v1_v2.csv` shows how the old `inside` rows reclassify.
+   Linear records are not wrapped, so a target on a short linear fragment
+   (single-gene clones, cDNAs, the accessions in caveat 9) can have no gene on
+   one side; it then contributes only to the other side's distribution. That is
+   about 15 `IS4_all` rows and 2 `IS1182_all` rows.
 """
 
 
