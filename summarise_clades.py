@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Aggregate the per-clade seq2startstop runs under results/IS1182_clades/.
+Aggregate the per-clade seq2startstop runs in one results directory.
 
 Reads each <clade>_<boundary>/coordinates_with_genes.csv (real) and
 distances_random.csv (matched null), and produces:
 
   clade_summary.csv   one row per clade x boundary_type x direction
-  ks_tests.csv        significance tests; the "statistic" column is the KS D for\n                      the KS families and the Wilcoxon W for the paired family
-  ecdf_main_clades.png        ECDFs for the three disjoint clades A/B/C_all
-  ecdf_cladeC_subclades_start.png / _stop.png    small multiples per subclade
+  ks_tests.csv        significance tests; the "statistic" column is the KS D for
+                      the KS families and the Wilcoxon W for the paired family
+  prism_cdf_clades.csv        one column per clade x boundary x direction, every
+                              analysed distance, for cumulative plots in Prism
+  ecdf_families_x<N>.png      IS4 vs IS1182 ECDFs
+  ecdf_main_clades_x<N>.png   ECDFs for the families and clades A/B/C_all
+  ecdf_by_location_x<N>.png   IS1182_all / IS4_all split by where the target sits
+  ecdf_cladeC_subclades_{start,stop}_x<N>.png    small multiples per subclade
   CAVEATS.md          interpretation caveats that travel with the numbers
 
-Distances are measured from the centre of the 60 bp trimmed target
-(--anchor center --anchor_pos 31); the null uses the same anchor.
+Every target with a flanking gene annotation is analysed, including targets
+that sit inside a gene; their distances run to the nearest boundary on each
+side, whichever gene it belongs to. Distances are measured from the centre of
+the 60 bp trimmed target (--anchor center --anchor_pos 31); the null uses the
+same anchor.
 
 Run under the biopytools environment (pandas + scipy):
-  micromamba run -n biopytools python summarise_clades.py
+  micromamba run -n biopytools python summarise_clades.py --results_dir results/IS1182_clades_v2
 """
 
 import argparse
@@ -96,13 +104,12 @@ def load_run(run_dir: Path) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
 
 def analysed_subset(real: pd.DataFrame) -> pd.DataFrame:
     """
-    Rows the pipeline actually reports distances for: no error, not fully inside
-    a gene body, and with at least one flanking gene annotated. Mirrors the two
-    filters applied in seq2startstop.main before distances.csv is written.
+    Rows the pipeline actually reports distances for: no error and at least one
+    flanking gene annotated. Targets inside a gene are kept. Mirrors the filter
+    applied in seq2startstop.main before distances.csv is written.
     """
     ok = real[real["error"].isna()]
-    keep = (ok["location"] != "inside") & ~(ok["up_dist"].isna() & ok["down_dist"].isna())
-    return ok[keep]
+    return ok[~(ok["up_dist"].isna() & ok["down_dist"].isna())]
 
 
 # --------------------------------------------------------------------------
@@ -312,6 +319,95 @@ def plot_series_grid(data, series, xmax, out_path, title, subtitle=None, ncol_le
     print(f"wrote {out_path}")
 
 
+LOCATIONS = [("all", "all targets"), ("inside", "inside a gene"),
+             ("partial", "partial overlap"), ("intergenic", "intergenic")]
+
+
+def plot_by_location(data, clade, xmax, out_path):
+    """
+    2x2 ECDFs for one set, one line per target location class plus all targets
+    together, with the set's matched null. Shows where the targets that used to
+    be dropped as 'inside a gene' fall relative to the rest.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(11.5, 8), sharex=True, sharey=True)
+    fig.patch.set_facecolor("#fcfcfb")
+
+    for r, boundary in enumerate(BOUNDARIES):
+        entry = data.get((clade, boundary))
+        for c, direction in enumerate(DIRECTIONS):
+            ax = axes[r][c]
+            ax.set_facecolor("#fcfcfb")
+            end_labels = []
+            if entry is not None:
+                col = f"{direction}_dist"
+                real = entry["real"]
+                for i, (key, label) in enumerate(LOCATIONS):
+                    subset = real if key == "all" else real[real["location"] == key]
+                    x, y = ecdf(subset[col])
+                    if not x.size:
+                        continue
+                    ax.plot(x, y, color=SERIES[i], linewidth=2.4 if key == "all" else 1.6,
+                            label=f"{label} (n={x.size})")
+                    inside = x[x <= xmax]
+                    if inside.size:
+                        end_labels.append((float(y[inside.size - 1]), label, SERIES[i]))
+                if entry["null"] is not None:
+                    xr, yr = ecdf(entry["null"][col])
+                    if xr.size:
+                        ax.plot(xr, yr, color=NULL_INK, linewidth=1.1, linestyle="--",
+                                label="random-placement null")
+            style_axis(ax, xmax)
+            place_end_labels(ax, end_labels)
+            if r == 0:
+                ax.set_title(DIR_LABEL[direction], color=TEXT_PRIMARY, fontsize=11)
+            if c == 0:
+                ax.set_ylabel(f"{boundary} codon\ncumulative fraction",
+                              color=TEXT_SECONDARY, fontsize=9)
+            if r == 1:
+                ax.set_xlabel("Distance from target centre (bp)",
+                              color=TEXT_SECONDARY, fontsize=9)
+
+    # Legend from the panel with the most entries, so n reflects that panel.
+    best = max((a for row in axes for a in row),
+               key=lambda a: len(a.get_legend_handles_labels()[0]))
+    handles, _ = best.get_legend_handles_labels()
+    labels = [h.get_label().split(" (n=")[0] for h in handles]
+    fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False,
+               fontsize=8, labelcolor=TEXT_SECONDARY, bbox_to_anchor=(0.5, -0.005))
+    fig.suptitle(
+        f"{clade}: distance from target centre to nearest flanking codon, by target location\n"
+        "location = where the 60 bp target sits; every class is measured to the nearest "
+        "boundary on each side, whichever gene owns it",
+        color=TEXT_PRIMARY, fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"wrote {out_path}")
+
+
+def write_prism_cdf(data, out_path):
+    """
+    One column per <clade>_<Boundary>_<Direction>, holding every analysed
+    distance for that run (blank-padded to the longest column), ready to paste
+    into Prism for cumulative-distribution plots. Same rows as the ECDFs here.
+    """
+    order = FAMILIES + MAIN_CLADES + SUBCLADES
+    columns = {}
+    for clade in order + sorted({c for c, _ in data} - set(order)):
+        for boundary in BOUNDARIES:
+            entry = data.get((clade, boundary))
+            if entry is None:
+                continue
+            for direction in DIRECTIONS:
+                vals = pd.to_numeric(entry["real"][f"{direction}_dist"], errors="coerce").dropna()
+                name = f"{clade}_{boundary.capitalize()}_{direction.capitalize()}"
+                # Nullable ints: padding stays blank instead of turning every value into "12.0".
+                columns[name] = vals.round().astype("Int64").reset_index(drop=True)
+    pd.DataFrame(columns).to_csv(out_path, index=False)
+    print(f"wrote {out_path}  ({len(columns)} columns)")
+
+
 def plot_subclades(data, boundary, xmax, out_path):
     """Small multiples — one panel per cladeC subclade, plus cladeC_all."""
     panels = ["cladeC_all"] + SUBCLADES
@@ -469,14 +565,15 @@ directory. They are properties of the input data, not of the pipeline.
 
 
 def main():
-    here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results_dir", default=str(here))
-    ap.add_argument("--fasta_dir",
-                    default=str(here.parents[1] / "IS1182_clade_targets_trimmed"))
-    ap.add_argument("--xmax", type=float, default=400.0,
-                    help="x-axis limit for the ECDF figures (bp). Default 400.")
+    ap.add_argument("--results_dir", required=True,
+                    help="Directory holding the <clade>_<start|stop> run directories.")
+    ap.add_argument("--fasta_dir", required=True,
+                    help="Directory holding the per-clade target FASTA files.")
+    ap.add_argument("--xmax", type=float, nargs="+", default=[400.0, 2000.0],
+                    help="x-axis limit(s) for the ECDF figures (bp); one set of figures "
+                         "per value, suffixed _x<N>. Default 400 2000.")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -506,9 +603,9 @@ def main():
         raw, real, null = e["raw"], e["real"], e["null"]
         n_input = count_fasta_records(fasta_dir / FASTA_FOR.get(clade, "___missing___"))
         ok = raw[raw["error"].isna()]
-        loc = ok["location"].value_counts()
-        n_unannotated = int(((ok["location"] == "intergenic")
-                             & ok["up_dist"].isna() & ok["down_dist"].isna()).sum())
+        n_unannotated = int((ok["up_dist"].isna() & ok["down_dist"].isna()).sum())
+        # Location of analysed rows only, so inside + partial + intergenic == n_analysed.
+        loc = real["location"].value_counts()
         for direction in DIRECTIONS:
             r = describe(real[f"{direction}_dist"])
             base = dict(
@@ -519,9 +616,11 @@ def main():
                 n_error=int(raw["error"].notna().sum()),
                 n_inside=int(loc.get("inside", 0)),
                 n_partial=int(loc.get("partial", 0)),
-                n_intergenic=int(loc.get("intergenic", 0)) - n_unannotated,
+                n_intergenic=int(loc.get("intergenic", 0)),
                 n_unannotated=n_unannotated,
                 n_analysed=len(real),
+                n_anchor_in_gene=int(real["anchor_in_gene"].notna().sum())
+                if "anchor_in_gene" in real.columns else np.nan,
                 n_genomes=int(real["accession"].nunique()),
                 # Forward and reverse entries at the same locus normalise to the
                 # same 60 bp window, so they contribute two near-identical
@@ -620,29 +719,37 @@ def main():
     ks_df.to_csv(ks_path, index=False)
     print(f"wrote {ks_path}  ({len(ks_df)} tests)")
 
+    write_prism_cdf(data, results_dir / "prism_cdf_clades.csv")
+
     # ---- figures -------------------------------------------------------
-    plot_series_grid(
-        data, FAMILIES, args.xmax, results_dir / "ecdf_families.png",
-        "IS4 vs IS1182 target sites: distance from target centre to nearest flanking codon",
-        ncol_legend=2,
-    )
-    plot_series_grid(
-        data, MAIN_SERIES, args.xmax, results_dir / "ecdf_main_clades.png",
-        "IS4 and IS1182 target sites, whole families and IS1182 clades",
-        subtitle="IS1182_all is the union of cladeA + cladeB + cladeC_all — a whole "
-                 "and its parts, not independent series",
-    )
-    for boundary in BOUNDARIES:
-        if any((c, boundary) in data for c in SUBCLADES):
-            plot_subclades(data, boundary, args.xmax,
-                           results_dir / f"ecdf_cladeC_subclades_{boundary}.png")
+    for xmax in args.xmax:
+        sfx = f"_x{int(xmax)}"
+        plot_series_grid(
+            data, FAMILIES, xmax, results_dir / f"ecdf_families{sfx}.png",
+            "IS4 vs IS1182 target sites: distance from target centre to nearest flanking codon",
+            ncol_legend=2,
+        )
+        plot_series_grid(
+            data, MAIN_SERIES, xmax, results_dir / f"ecdf_main_clades{sfx}.png",
+            "IS4 and IS1182 target sites, whole families and IS1182 clades",
+            subtitle="IS1182_all is the union of cladeA + cladeB + cladeC_all — a whole "
+                     "and its parts, not independent series",
+        )
+        for fam in FAMILIES:
+            if any((fam, b) in data for b in BOUNDARIES):
+                plot_by_location(data, fam, xmax,
+                                 results_dir / f"ecdf_by_location_{fam}{sfx}.png")
+        for boundary in BOUNDARIES:
+            if any((c, boundary) in data for c in SUBCLADES):
+                plot_subclades(data, boundary, xmax,
+                               results_dir / f"ecdf_cladeC_subclades_{boundary}{sfx}.png")
 
     (results_dir / "CAVEATS.md").write_text(CAVEATS)
     print(f"wrote {results_dir / 'CAVEATS.md'}")
 
     # ---- console digest ------------------------------------------------
     print("\n=== headline: median distance from target centre (bp), real vs null ===")
-    cols = ["clade", "boundary_type", "direction", "n_analysed",
+    cols = ["clade", "boundary_type", "direction", "n_analysed", "n_inside",
             "real_n", "real_median", "null_median", "enrichment_le100"]
     have = [c for c in cols if c in summary.columns]
     with pd.option_context("display.width", 200, "display.max_rows", 200):

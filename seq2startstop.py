@@ -120,29 +120,71 @@ def map_query_pos_to_ref(best_aln: Dict[str, Any], query_len: int, anchor_pos: i
     return None
 
 
+def _gene_segments(parts: List[Any], strand: int | None) -> List[tuple]:
+    """
+    Half-open genomic intervals actually occupied by a feature.
+
+    A feature that crosses the origin of a circular molecule, e.g.
+    join(4044092..4044757,1..936), has BioPython .start == 0 and .end == the
+    genome length, so treating it as one [start, end) interval makes that single
+    gene "contain" the whole chromosome: every target in the genome was then
+    classified 'inside' and dropped. Parts are listed in biological order, so the
+    origin is crossed wherever consecutive parts step backwards (leftwards on the
+    + strand, rightwards on the - strand); each run between such steps is one
+    contiguous interval. Ordinary multi-part features (ribosomal frameshifts)
+    never step backwards and stay a single interval.
+    """
+    runs: List[List[Any]] = [[parts[0]]]
+    for prev, cur in zip(parts, parts[1:]):
+        backwards = cur.start < prev.start if strand != -1 else cur.start > prev.start
+        if backwards:
+            runs.append([cur])
+        else:
+            runs[-1].append(cur)
+    return [(int(min(p.start for p in run)), int(max(p.end for p in run))) for run in runs]
+
+
 def extract_genes_with_boundary(gb_record: Any, boundary_type: str) -> List[Dict[str, Any]]:
     genes = []
     for feat in gb_record.features:
-        if feat.type in ('CDS', 'gene'):
+        if feat.type in ('CDS', 'gene') and feat.location is not None:
             qual = feat.qualifiers
             gene = qual.get('locus_tag', ['?'])[0]
             strand = feat.location.strand
-            loc = feat.location
+            # Codons come from the first/last part in biological order, not from
+            # the feature's min/max extent, which for an origin-spanning gene are
+            # the two ends of the genome rather than its start and stop codons.
+            parts = feat.location.parts
+            first, last = parts[0], parts[-1]
             if boundary_type == "stop":
-                boundary = loc.end - 1 if strand == 1 else loc.start
+                boundary = last.end - 1 if strand == 1 else last.start
             else:
-                boundary = loc.start if strand == 1 else loc.end - 1
+                boundary = first.start if strand == 1 else first.end - 1
             genes.append({
                 'gene': gene,
-                'start': int(loc.start),
-                'end': int(loc.end),
+                'start': int(feat.location.start),
+                'end': int(feat.location.end),
+                'segments': _gene_segments(parts, strand),
                 'strand': strand,
                 'boundary': int(boundary)
             })
     return genes
 
 
-def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tuple:
+def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]],
+                        genome_length: int | None = None, circular: bool = False) -> tuple:
+    """
+    Nearest gene boundary upstream and downstream of query_boundary, each
+    judged in that gene's own orientation. Every gene is a candidate regardless
+    of where the query sits: a query inside a gene is credited to whichever
+    boundary is nearest on each side, whether that belongs to the gene it is
+    inside or to a neighbour.
+
+    On a circular molecule distances are taken around the origin, so a query
+    near either end of the sequence still reaches the next gene across it
+    instead of reporting a spurious long distance or no gene at all.
+    """
+    wrap = circular and genome_length
     min_upstream = None
     min_downstream = None
     min_dist_up = 1e12
@@ -151,20 +193,28 @@ def find_flanking_genes(query_boundary: int, genes: List[Dict[str, Any]]) -> tup
         b = gene['boundary']
         if gene['strand'] == 1:
             dist_up = query_boundary - b
-            if dist_up >= 0 and dist_up < min_dist_up:
-                min_upstream, min_dist_up = gene, dist_up
             dist_down = b - query_boundary
-            if dist_down >= 0 and dist_down < min_dist_down:
-                min_downstream, min_dist_down = gene, dist_down
         elif gene['strand'] == -1:
             dist_up = b - query_boundary
-            if dist_up >= 0 and dist_up < min_dist_up:
-                min_upstream, min_dist_up = gene, dist_up
             dist_down = query_boundary - b
-            if dist_down >= 0 and dist_down < min_dist_down:
-                min_downstream, min_dist_down = gene, dist_down
+        else:
+            continue
+        if wrap:
+            dist_up %= genome_length
+            dist_down %= genome_length
+        if dist_up >= 0 and dist_up < min_dist_up:
+            min_upstream, min_dist_up = gene, dist_up
+        if dist_down >= 0 and dist_down < min_dist_down:
+            min_downstream, min_dist_down = gene, dist_down
     return (min_upstream, min_dist_up if min_upstream else None,
             min_downstream, min_dist_down if min_downstream else None)
+
+
+def gene_containing(pos: int, genes: List[Dict[str, Any]]) -> str | None:
+    """Locus tag(s) of every gene whose body covers 0-based position pos."""
+    tags = sorted({g['gene'] for g in genes
+                   if any(s <= pos < e for s, e in g['segments'])})
+    return ";".join(tags) if tags else None
 
 
 def classify_alignment(align_start: int, align_end: int, genes: List[Dict[str, Any]]) -> str:
@@ -175,18 +225,27 @@ def classify_alignment(align_start: int, align_end: int, genes: List[Dict[str, A
       'intergenic' – no overlap with any gene
 
     Uses half-open interval arithmetic matching BioPython's SeqFeature
-    coordinates. Completely independent of boundary_type.
+    coordinates, against each gene's real segments (see _gene_segments).
+    Completely independent of boundary_type, and purely descriptive: it does not
+    decide whether a target is counted.
     """
     overlapping = [
-        g for g in genes
-        if align_start < g['end'] and align_end > g['start']
+        (s, e) for g in genes for s, e in g['segments']
+        if align_start < e and align_end > s
     ]
     if not overlapping:
         return 'intergenic'
-    for g in overlapping:
-        if align_start >= g['start'] and align_end <= g['end']:
+    for s, e in overlapping:
+        if align_start >= s and align_end <= e:
             return 'inside'
     return 'partial'
+
+
+def load_genbank(gb_path: Path, boundary_type: str) -> tuple[List[Dict[str, Any]], int, bool]:
+    """Genes, sequence length and circular topology for one GenBank record."""
+    record = next(SeqIO.parse(gb_path, "genbank"))
+    circular = record.annotations.get('topology', '').lower() == 'circular'
+    return extract_genes_with_boundary(record, boundary_type), len(record.seq), circular
 
 
 def _random_one_accession(
@@ -205,7 +264,9 @@ def _random_one_accession(
     Randomly place n_random sequences of sampled lengths within one genome.
     Each accession receives a deterministic but unique seed derived from the
     global seed so results are reproducible regardless of process order.
-    Applies the same inside-gene and unannotated filters as the real pipeline.
+    Applies the same filter as the real pipeline: placements are only rejected
+    when no flanking gene exists at all. Placements inside a gene are kept, as
+    real targets inside a gene are.
 
     The measurement point matches the real pipeline exactly: with
     anchor_mode='center' distances are taken from a single anchor at the same
@@ -220,10 +281,10 @@ def _random_one_accession(
     per genome the same way the real data can be, which is needed to guard
     against pseudoreplication across targets from the same genome.
     counts tracks every valid placement attempt by location category for Plot 2b.
-      counts['inside']     – rejected: fell fully inside a gene
+      counts['inside']     – accepted: fully inside a gene
       counts['partial']    – accepted: partially overlapped a gene
       counts['intergenic'] – accepted: fully intergenic and annotated
-      counts['unannotated']– rejected: intergenic but no flanking genes found
+      counts['unannotated']– rejected: no flanking gene found in either direction
     """
     rng = np.random.default_rng(seed)
 
@@ -236,9 +297,7 @@ def _random_one_accession(
         print(f"Warning: GenBank file not found for {accession}, skipping random control.")
         return [], {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
 
-    record = next(SeqIO.parse(gb_path, "genbank"))
-    genome_length = len(record.seq)
-    genes = extract_genes_with_boundary(record, boundary_type)
+    genes, genome_length, circular = load_genbank(gb_path, boundary_type)
 
     if verbose:
         print(f"Generating {n_random} random placements for {accession} "
@@ -259,16 +318,14 @@ def _random_one_accession(
         rand_end = rand_start + length
 
         location = classify_alignment(rand_start, rand_end, genes)
-        if location == 'inside':
-            counts['inside'] += 1
-            continue
 
         if anchor_mode == "center":
             off = anchor_pos - 1 if 0 <= anchor_pos - 1 < length else length // 2
-            up_gene, up_dist, down_gene, down_dist = find_flanking_genes(rand_start + off, genes)
+            up_gene, up_dist, down_gene, down_dist = find_flanking_genes(
+                rand_start + off, genes, genome_length, circular)
         else:
-            up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
-            up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes)
+            up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes, genome_length, circular)
+            up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes, genome_length, circular)
             distances = [
                 ("start", rand_start, up_s, up_d_s, down_s, down_d_s),
                 ("end",   rand_end,   up_e, up_d_e, down_e, down_d_e)
@@ -281,7 +338,7 @@ def _random_one_accession(
             continue
 
         # Accepted placement — record location and distances
-        counts[location] += 1   # 'partial' or 'intergenic'
+        counts[location] += 1   # 'inside', 'partial' or 'intergenic'
         rand_pairs.append((
             accession,
             float(up_dist) if up_dist is not None else None,
@@ -380,8 +437,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
         )
         if not gb_path.exists():
             raise FileNotFoundError(f"Missing GenBank file: {gb_path}")
-        record = next(SeqIO.parse(gb_path, "genbank"))
-        genes = extract_genes_with_boundary(record, boundary_type)
+        genes, genome_length, circular = load_genbank(gb_path, boundary_type)
 
         # Geometric classification: independent of boundary_type, so location
         # counts are consistent across --boundary_type stop and start runs.
@@ -399,11 +455,14 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
                 rel_boundary = (rel_start + rel_end) // 2
                 anchor_source = "midpoint_fallback"
             which = "center"
-            up_gene, up_dist, down_gene, down_dist = find_flanking_genes(rel_boundary, genes)
+            up_gene, up_dist, down_gene, down_dist = find_flanking_genes(
+                rel_boundary, genes, genome_length, circular)
         else:
             anchor_source = "endpoint_min"
-            up_start, up_dist_start, down_start, down_dist_start = find_flanking_genes(rel_start, genes)
-            up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(rel_end, genes)
+            up_start, up_dist_start, down_start, down_dist_start = find_flanking_genes(
+                rel_start, genes, genome_length, circular)
+            up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(
+                rel_end, genes, genome_length, circular)
             distances = [
                 ("start", rel_start, up_start, up_dist_start, down_start, down_dist_start),
                 ("end",   rel_end,   up_end,   up_dist_end,   down_end,   down_dist_end)
@@ -428,6 +487,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "align_end": rel_end,
             "anchor": rel_boundary + 1,
             "anchor_source": anchor_source,
+            "anchor_in_gene": gene_containing(rel_boundary, genes),
             "which_boundary_used": which,
             "boundary_used": rel_boundary + 1,
             "up_gene": up_gene_name,
@@ -453,6 +513,7 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "align_end": None,
             "anchor": None,
             "anchor_source": None,
+            "anchor_in_gene": None,
             "which_boundary_used": None,
             "boundary_used": None,
             "up_gene": None,
@@ -615,14 +676,16 @@ def main():
 
     # Capture counts from all valid (non-error) results before any filtering.
     # location classification is boundary_type-independent (geometric overlap).
+    # A row with no flanking gene on either side has nothing to measure against
+    # (in practice a GenBank record with no gene/CDS features), whatever its
+    # location label; every other row is counted, inside a gene or not.
     valid_before  = [r for r in results if not r['error']]
-    n_inside      = sum(1 for r in valid_before if r.get('location') == 'inside')
-    n_partial     = sum(1 for r in valid_before if r.get('location') == 'partial')
-    n_unannotated = sum(1 for r in valid_before
-                        if r.get('location') == 'intergenic'
-                        and r.get('up_dist') is None
-                        and r.get('down_dist') is None)
-    n_outside     = len(valid_before) - n_inside - n_partial - n_unannotated
+    annotated     = [r for r in valid_before
+                     if not (r.get('up_dist') is None and r.get('down_dist') is None)]
+    n_unannotated = len(valid_before) - len(annotated)
+    n_inside      = sum(1 for r in annotated if r.get('location') == 'inside')
+    n_partial     = sum(1 for r in annotated if r.get('location') == 'partial')
+    n_outside     = sum(1 for r in annotated if r.get('location') == 'intergenic')
 
     # Write full CSV BEFORE filtering — all rows preserved with location values intact
     csv_out_path = output_dir / args.csv_out
@@ -630,7 +693,7 @@ def main():
         fieldnames = [
             "accession", "query", "is_reverse", "location",
             "seq_start", "seq_end", "align_start", "align_end",
-            "anchor", "anchor_source",
+            "anchor", "anchor_source", "anchor_in_gene",
             "which_boundary_used", "boundary_used",
             "up_gene", "up_boundary", "up_dist",
             "down_gene", "down_boundary", "down_dist",
@@ -641,23 +704,23 @@ def main():
         for r in results:
             writer.writerow(r)
 
-    # Filter 1: alignment fully inside a gene body
+    # Targets inside a gene are NOT filtered. Dropping them removed exactly the
+    # sites furthest from any codon and pulled the distance distribution towards
+    # zero. Their distances run to the nearest boundary on each side, which may
+    # belong to the gene they sit in or to a neighbouring gene.
+    # Only filter: no flanking gene annotation at all (no error, both distances None).
     n_before = len(results)
-    results_filtered = [r for r in results if r.get('location') != 'inside']
-    n_removed = n_before - len(results_filtered)
-    if n_removed:
-        print(f"Filtered out {n_removed} result(s) where alignment is fully inside a gene body.")
-
-    # Filter 2: unannotated regions (intergenic classification but no flanking genes, no error)
-    n_before = len(results_filtered)
-    results_filtered = [r for r in results_filtered
+    results_filtered = [r for r in results
                         if r.get('error')
                         or not (r.get('up_dist') is None and r.get('down_dist') is None)]
     n_unannotated_removed = n_before - len(results_filtered)
     if n_unannotated_removed:
         print(f"Filtered out {n_unannotated_removed} result(s) with no flanking gene annotation.")
+    print(f"Distances reported for {n_inside + n_partial + n_outside} target(s): "
+          f"{n_inside} inside a gene, {n_partial} partially overlapping, "
+          f"{n_outside} intergenic.")
 
-    # dist CSV uses filtered results (intergenic + partial only)
+    # dist CSV uses filtered results (inside + partial + intergenic)
     dist_out_path = output_dir / args.dist_out
     with open(dist_out_path, "w", newline="") as dcsv:
         writer = csv.writer(dcsv)
@@ -850,7 +913,8 @@ def main():
 
         # ---- Plot 2b: random location category counts ----
         # Shows the proportion of random placements falling in each category,
-        # including rejected placements, for comparison with the real data.
+        # including placements rejected as unannotated, for comparison with the
+        # real data.
         if any(rand_counts.values()):
             fig2r, ax2r = plt.subplots()
             rand_loc_counts = [

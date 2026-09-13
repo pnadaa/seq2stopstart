@@ -122,10 +122,12 @@ One row per input sequence. Columns:
 | `accession` | Genome accession |
 | `query` | Original FASTA header |
 | `is_reverse` | Whether the input coordinates implied a reverse-strand entry |
+| `location` | Where the aligned target sits: `inside` (fully within one gene), `partial` (overlaps a gene edge) or `intergenic`. Descriptive only — every class is analysed |
 | `seq_start` / `seq_end` | Normalised (ascending) input coordinate window |
 | `align_start` / `align_end` | Absolute genomic coordinates of the best alignment, mapped back to forward-strand genome coordinates (1-based inclusive) |
 | `anchor` | Genomic coordinate the distances were measured from (1-based) |
 | `anchor_source` | `aligned` (anchor mapped cleanly through the alignment), `midpoint_fallback` (anchor base gapped/uncovered, alignment midpoint used instead), or `endpoint_min` under `--anchor endpoints` |
+| `anchor_in_gene` | Locus tag(s) of the gene(s) whose body covers the measurement point, `;`-separated; empty when it is intergenic. Compare with `up_gene`/`down_gene` to see when a flanking boundary belongs to a neighbouring gene |
 | `which_boundary_used` | Which alignment endpoint (`start` or `end`) was closest to a flanking gene, or `center` under `--anchor center` |
 | `boundary_used` | Absolute genomic coordinate of the measurement point |
 | `up_gene` / `up_boundary` / `up_dist` | Locus tag, boundary coordinate, and distance (bp) of the upstream flanking gene |
@@ -137,7 +139,9 @@ One row per input sequence. Columns:
 ## **`distances.csv`**
 
 Two-column file (`up_dist`, `down_dist`) for successfully processed entries.\
-Convenient for downstream statistical analysis (errors are excluded).
+Convenient for downstream statistical analysis. Errors and targets with no\
+flanking gene annotation at all are excluded; targets inside a gene are\
+**included**.
 
 ## **`distances_random.csv`**
 
@@ -219,6 +223,30 @@ python seq2startstop.py \
     endpoint with the shorter minimum flanking distance is reported. Note that this\
     is a min-of-two statistic and therefore shifts the reported distribution\
     downward relative to any single fixed reference point.
+
+-   **Targets inside genes are counted.** Every target is measured to the nearest\
+    gene boundary upstream and downstream of it — each gene judged in its own\
+    orientation — whether or not the target sits inside a gene, and whether that\
+    boundary belongs to the gene it sits in or to a neighbour. For a target inside\
+    a + strand gene, for example, the downstream stop codon is usually that gene's\
+    own and the upstream stop codon is the previous gene's. Earlier versions\
+    dropped every target fully inside a gene, which removed the sites furthest\
+    from any codon and pulled cumulative distance distributions towards zero. The\
+    random null keeps inside-gene placements for the same reason. Only targets\
+    with no flanking gene in either direction (GenBank records without gene/CDS\
+    features) are excluded.
+
+-   **Origin-spanning genes:** a gene that crosses the origin of a circular\
+    molecule (`join(4044092..4044757,1..936)`) is handled as its real segments,\
+    with its start and stop codons taken from its first and last parts in\
+    biological order. Earlier versions used the feature's min/max extent, which\
+    made that one gene cover the entire chromosome — so every target in any\
+    genome containing such a gene was classified inside a gene and dropped — and\
+    placed its start/stop codon at the genome ends.
+
+-   **Circular molecules:** for records whose GenBank topology is `circular`,\
+    distances are measured around the origin, so a target near either end of the\
+    sequence reaches the next gene across it. Linear records are not wrapped.
 
 -   **`--anchor center`:** measures instead from one fixed position inside the\
     target (`--anchor_pos`, default 31 — the first base past the midpoint of a\
