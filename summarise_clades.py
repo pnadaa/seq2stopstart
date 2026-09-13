@@ -380,7 +380,7 @@ def plot_by_location(data, clade, xmax, out_path):
         "boundary on each side, whichever gene owns it",
         color=TEXT_PRIMARY, fontsize=12,
     )
-    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.05, 1, 0.95))
     fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f"wrote {out_path}")
@@ -558,9 +558,34 @@ directory. They are properties of the input data, not of the pipeline.
    target set is regenerated.
 
 10. **Genomes with no usable annotation are dropped, not counted as zero.**
-   Rows classified `intergenic` with no flanking gene found are filtered out
-   before any distance statistic; `n_unannotated` in `clade_summary.csv` reports
-   how many.
+   Rows with no flanking gene on either side are filtered out before any
+   distance statistic; `n_unannotated` in `clade_summary.csv` reports how many.
+   In practice these are GenBank records with no `gene`/`CDS` features at all,
+   so nothing can be measured for them; re-annotating those genomes is the
+   only way to bring them in.
+
+11. **Targets inside a gene are counted.** Every annotated target contributes a
+   distance, whether it sits inside a gene, overlaps a gene edge, or is
+   intergenic (`n_inside`, `n_partial`, `n_intergenic`). Each distance runs to
+   the nearest boundary on that side — the gene the target sits in, or a
+   neighbouring gene if its boundary is nearer (`anchor_in_gene` vs
+   `up_gene`/`down_gene` in `coordinates_with_genes.csv`). The random null keeps
+   inside-gene placements too, so real and null still match. The previous
+   analysis in `results/IS1182_clades` dropped every target fully inside a gene
+   (and every null placement inside a gene), which removed the sites furthest
+   from a codon and pulled both ECDFs towards zero; its numbers are not
+   comparable with these. `comparison_vs_v1.csv` tabulates the change, and
+   `ecdf_by_location_*.png` shows each location class separately — the
+   all-target curve is a mixture of them, so a shift in it can come from the mix
+   as well as from the distances.
+
+12. **Origin-spanning genes and circular molecules.** A gene crossing the origin
+   of a circular molecule is handled as its real segments, with codons taken
+   from its first and last parts. Previously such a gene spanned the entire
+   chromosome, so every target in that genome was classified inside a gene and
+   dropped — true intergenic targets included — and its codons sat at the
+   genome ends. On circular records, distances now also wrap the origin.
+   `comparison_location_v1_v2.csv` shows how the old `inside` rows reclassify.
 """
 
 
