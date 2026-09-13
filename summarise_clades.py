@@ -510,10 +510,12 @@ directory. They are properties of the input data, not of the pipeline.
    these distances are bounded below by 0 and unbounded above, so a minority of
    genomes whose targets sit very far from any codon can dominate the
    magnitude-weighted signed ranks and cancel a consistent but modest shift in
-   the majority. **`IS4_all` stop/upstream is exactly this case**: 63% of its
-   genomes sit closer than their own null (sign test), while the Wilcoxon is
-   not significant. Neither number is wrong — IS4 is simply far more
-   heterogeneous between genomes than IS1182, whose clades run at 84-91%.
+   the majority. **`IS4_all` start/downstream is exactly this case**: 59% of its
+   genomes sit closer than their own null (sign test, Holm p ~ 1e-15), while the
+   Wilcoxon is not significant. Neither number is wrong. For stop/upstream the
+   two tests agree, but IS4 is still far more heterogeneous between genomes
+   (67% of genomes closer than their null) than IS1182, whose clades run at
+   80-96%.
 
 5. **The same locus is often present twice, once per orientation.** A forward
    entry (`X_100-159`) and a reverse entry (`X_159-100`) describe the same 60 bp
