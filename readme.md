@@ -100,6 +100,8 @@ One `.gbff` file per genome. By default, files are expected to be named\
 | `--output_dir` | ✅ | — | Directory for all output files (created if absent) |
 | `--gb_naming` | ❌ | `accession` | GenBank filename pattern; use `{accession}` as placeholder, e.g. `{accession}_genomic.gbff` |
 | `--boundary_type` | ❌ | `stop` | Gene boundary to measure distance to: `stop` or `start` |
+| `--anchor` | ❌ | `endpoints` | Point of the mapped target distances are measured from: `endpoints` (legacy) or `center` |
+| `--anchor_pos` | ❌ | `31` | 1-based position within the target used as the measurement point when `--anchor center` |
 | `--nproc` | ❌ | `1` | Number of parallel worker processes (on PBS, match your `ncpus` allocation) |
 | `--csv_out` | ❌ | `coordinates_with_genes.csv` | Filename for the main results CSV |
 | `--dist_out` | ❌ | `distances.csv` | Filename for the distances-only CSV |
@@ -121,9 +123,11 @@ One row per input sequence. Columns:
 | `query` | Original FASTA header |
 | `is_reverse` | Whether the input coordinates implied a reverse-strand entry |
 | `seq_start` / `seq_end` | Normalised (ascending) input coordinate window |
-| `align_start` / `align_end` | Absolute genomic coordinates of the best alignment, mapped back to forward-strand genome coordinates |
-| `which_boundary_used` | Which alignment endpoint (`start` or `end`) was closest to a flanking gene |
-| `boundary_used` | Absolute genomic coordinate of the selected alignment endpoint |
+| `align_start` / `align_end` | Absolute genomic coordinates of the best alignment, mapped back to forward-strand genome coordinates (1-based inclusive) |
+| `anchor` | Genomic coordinate the distances were measured from (1-based) |
+| `anchor_source` | `aligned` (anchor mapped cleanly through the alignment), `midpoint_fallback` (anchor base gapped/uncovered, alignment midpoint used instead), or `endpoint_min` under `--anchor endpoints` |
+| `which_boundary_used` | Which alignment endpoint (`start` or `end`) was closest to a flanking gene, or `center` under `--anchor center` |
+| `boundary_used` | Absolute genomic coordinate of the measurement point |
 | `up_gene` / `up_boundary` / `up_dist` | Locus tag, boundary coordinate, and distance (bp) of the upstream flanking gene |
 | `down_gene` / `down_boundary` / `down_dist` | Locus tag, boundary coordinate, and distance (bp) of the downstream flanking gene |
 | `score` | Smith–Waterman alignment score |
@@ -134,6 +138,14 @@ One row per input sequence. Columns:
 
 Two-column file (`up_dist`, `down_dist`) for successfully processed entries.\
 Convenient for downstream statistical analysis (errors are excluded).
+
+## **`distances_random.csv`**
+
+Written whenever `--n_random > 0`. Columns `accession`, `up_dist`, `down_dist` —
+one row per accepted random placement, using the same anchor as the real data.
+The `accession` label allows the null to be collapsed per genome the same way
+the real data can be, which is what guards against pseudoreplication when many
+targets come from the same genome.
 
 ## **`distance_distribution.png` (optional)**
 
@@ -202,9 +214,34 @@ python seq2startstop.py \
     header) are detected and coordinate-normalised before querying `blastdbcmd`.\
     Alignment coordinates are always reported in forward-strand genome space.
 
--   **Flanking gene logic:** For each alignment, both the `start` and `end`\
-    coordinates are compared against all gene boundaries; the endpoint with the\
-    shorter minimum flanking distance is used for reporting.
+-   **Flanking gene logic:** Under the default `--anchor endpoints`, both the\
+    `start` and `end` coordinates are compared against all gene boundaries and the\
+    endpoint with the shorter minimum flanking distance is reported. Note that this\
+    is a min-of-two statistic and therefore shifts the reported distribution\
+    downward relative to any single fixed reference point.
+
+-   **`--anchor center`:** measures instead from one fixed position inside the\
+    target (`--anchor_pos`, default 31 — the first base past the midpoint of a\
+    60 bp target), which for a target window centred on an insertion site is the\
+    insertion point itself. The position is interpreted in the target's own\
+    stranded orientation and mapped through the alignment, so gaps and\
+    reverse-strand entries land on the intended nucleotide. When `--n_random > 0`\
+    the random-placement null uses the same anchor offset, so real and null remain\
+    directly comparable. Rows where the anchor base is not covered by the local\
+    alignment fall back to the alignment midpoint and are flagged in\
+    `anchor_source`.
+
+-   **Coordinate convention:** `blastdbcmd -range` is 1-based inclusive while\
+    BioPython feature coordinates are 0-based, so all distance arithmetic is done\
+    0-based internally and coordinates are converted to 1-based inclusive only on\
+    output. A distance of 0 therefore means the anchor nucleotide *is* the gene\
+    boundary nucleotide. (Runs produced before this fix carried a +1 bp offset on\
+    `up_dist` and a −1 bp offset on `down_dist`; do not compare across the two at\
+    single-bp resolution.)
+
+-   **FASTA headers:** the accession/coordinate split takes the **last** `:` or\
+    `_` in the header, so accessions that themselves contain an underscore\
+    (`NC_055040`, `NM_001126745`, …) are parsed rather than dropped.
 
 -   **Error handling:** Failures (missing GenBank file, no alignment found, etc.)\
     are caught per-region and written to the output CSV with the `error` column\

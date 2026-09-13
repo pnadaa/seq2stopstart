@@ -9,6 +9,7 @@ from Bio import SeqIO
 from Bio.Align import PairwiseAligner
 from Bio.Seq import Seq
 import subprocess
+import tempfile
 import csv
 from multiprocessing import Pool
 from functools import partial
@@ -18,20 +19,36 @@ from typing import Dict, Any, List
 
 
 def extract_sequence_with_blastdbcmd(accession: str, start: int, end: int, blast_db: str, temp_dir: str, verbose: bool = False) -> str:
-    out_fasta = os.path.join(temp_dir, f"{accession}_{start}_{end}.fa")
-    blast_cmd = [
-        "blastdbcmd", "-db", blast_db,      # blast_db is a prefix e.g. /data/blastdb/mydb
-        "-entry", accession,
-        "-range", f"{start}-{end}",
-        "-outfmt", "%f", "-out", out_fasta
-    ]
-    if verbose:
-        print("Running: " + " ".join(blast_cmd))
-    subprocess.run(blast_cmd, check=True)
-    seq_record = next(SeqIO.parse(out_fasta, "fasta"))
-    seq = str(seq_record.seq)
-    os.remove(out_fasta)
-    return seq
+    # A unique temp file per call, not per coordinate window. A forward entry
+    # (X_100-159) and its reverse counterpart (X_159-100) normalise to the same
+    # window, so a name built from accession+coords collides between workers:
+    # one would delete the file while another was still reading it, producing
+    # sporadic FileNotFoundError / empty-record failures that differed from run
+    # to run. mkstemp keeps each extraction private.
+    fd, out_fasta = tempfile.mkstemp(prefix=f"{accession}_{start}_{end}_",
+                                     suffix=".fa", dir=temp_dir)
+    os.close(fd)
+    try:
+        blast_cmd = [
+            "blastdbcmd", "-db", blast_db,      # blast_db is a prefix e.g. /data/blastdb/mydb
+            "-entry", accession,
+            "-range", f"{start}-{end}",
+            "-outfmt", "%f", "-out", out_fasta
+        ]
+        if verbose:
+            print("Running: " + " ".join(blast_cmd))
+        subprocess.run(blast_cmd, check=True)
+        seq_record = next(SeqIO.parse(out_fasta, "fasta"), None)
+        if seq_record is None:
+            # StopIteration would otherwise propagate with an empty message and
+            # land in the CSV as a blank 'error', i.e. a silently dropped row.
+            raise RuntimeError(
+                f"blastdbcmd returned no sequence for {accession}:{start}-{end}"
+            )
+        return str(seq_record.seq)
+    finally:
+        if os.path.exists(out_fasta):
+            os.remove(out_fasta)
 
 
 def align_query_to_ref(query_rna: str, ref_dna: str) -> Dict[str, Any] | None:
@@ -75,6 +92,32 @@ def align_query_to_ref(query_rna: str, ref_dna: str) -> Dict[str, Any] | None:
         if best is None or s['score'] > best['score']:
             best = s
     return best
+
+
+def map_query_pos_to_ref(best_aln: Dict[str, Any], query_len: int, anchor_pos: int) -> int | None:
+    """
+    Map a 1-based position within the query (in the query's own, as-supplied
+    orientation) onto a 0-based offset into the forward reference window.
+
+    align_query_to_ref aligns either the query or its reverse complement against
+    the forward reference; when the reverse complement won, position p of the
+    original query sits at offset (query_len - 1 - (p - 1)) of the aligned
+    sequence, so the anchor is remapped before the block lookup.
+
+    Returns None when the anchor base is not covered by the local alignment
+    (gapped, or outside the aligned span) — the caller falls back and flags it.
+    """
+    q0 = anchor_pos - 1
+    if not (0 <= q0 < query_len):
+        return None
+    if best_aln['strand'] == '-':
+        q0 = query_len - 1 - q0
+
+    aln = best_aln['aln']
+    for (t_start, _t_end), (q_start, q_end) in zip(aln.aligned[0], aln.aligned[1]):
+        if q_start <= q0 < q_end:
+            return int(t_start + (q0 - q_start))
+    return None
 
 
 def extract_genes_with_boundary(gb_record: Any, boundary_type: str) -> List[Dict[str, Any]]:
@@ -154,16 +197,29 @@ def _random_one_accession(
     boundary_type: str,
     n_random: int,
     seed: int,
-    verbose: bool = False
-) -> tuple[List[float], List[float], Dict[str, int]]:
+    verbose: bool = False,
+    anchor_mode: str = "endpoints",
+    anchor_pos: int = 31
+) -> tuple[List[tuple], Dict[str, int]]:
     """
     Randomly place n_random sequences of sampled lengths within one genome.
     Each accession receives a deterministic but unique seed derived from the
     global seed so results are reproducible regardless of process order.
     Applies the same inside-gene and unannotated filters as the real pipeline.
 
-    Returns (rand_ups, rand_downs, counts) where counts tracks every valid
-    placement attempt by location category for use in Plot 2b.
+    The measurement point matches the real pipeline exactly: with
+    anchor_mode='center' distances are taken from a single anchor at the same
+    offset into each random placement that the real anchor takes into the real
+    target, rather than from whichever placement endpoint happens to be closer.
+    Without this the null and the real distribution would not be comparable.
+
+    Returns (rand_pairs, counts). rand_pairs holds one
+    (accession, up_dist, down_dist) tuple per accepted placement — kept paired,
+    and possibly containing None, so the written null CSV has the same row
+    semantics as distances.csv. The accession label lets the null be collapsed
+    per genome the same way the real data can be, which is needed to guard
+    against pseudoreplication across targets from the same genome.
+    counts tracks every valid placement attempt by location category for Plot 2b.
       counts['inside']     – rejected: fell fully inside a gene
       counts['partial']    – accepted: partially overlapped a gene
       counts['intergenic'] – accepted: fully intergenic and annotated
@@ -178,7 +234,7 @@ def _random_one_accession(
     )
     if not gb_path.exists():
         print(f"Warning: GenBank file not found for {accession}, skipping random control.")
-        return [], [], {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
+        return [], {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
 
     record = next(SeqIO.parse(gb_path, "genbank"))
     genome_length = len(record.seq)
@@ -188,7 +244,7 @@ def _random_one_accession(
         print(f"Generating {n_random} random placements for {accession} "
               f"(genome length: {genome_length:,} bp)")
 
-    rand_ups, rand_downs = [], []
+    rand_pairs: List[tuple] = []
     counts = {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
     placed = 0
     attempts = 0
@@ -207,14 +263,18 @@ def _random_one_accession(
             counts['inside'] += 1
             continue
 
-        up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
-        up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes)
-        distances = [
-            ("start", rand_start, up_s, up_d_s, down_s, down_d_s),
-            ("end",   rand_end,   up_e, up_d_e, down_e, down_d_e)
-        ]
-        min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
-        _, _, up_gene, up_dist, down_gene, down_dist = min_tuple
+        if anchor_mode == "center":
+            off = anchor_pos - 1 if 0 <= anchor_pos - 1 < length else length // 2
+            up_gene, up_dist, down_gene, down_dist = find_flanking_genes(rand_start + off, genes)
+        else:
+            up_s, up_d_s, down_s, down_d_s = find_flanking_genes(rand_start, genes)
+            up_e, up_d_e, down_e, down_d_e = find_flanking_genes(rand_end, genes)
+            distances = [
+                ("start", rand_start, up_s, up_d_s, down_s, down_d_s),
+                ("end",   rand_end,   up_e, up_d_e, down_e, down_d_e)
+            ]
+            min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
+            _, _, up_gene, up_dist, down_gene, down_dist = min_tuple
 
         if up_dist is None and down_dist is None:
             counts['unannotated'] += 1
@@ -222,17 +282,18 @@ def _random_one_accession(
 
         # Accepted placement — record location and distances
         counts[location] += 1   # 'partial' or 'intergenic'
-        if up_dist is not None:
-            rand_ups.append(float(up_dist))
-        if down_dist is not None:
-            rand_downs.append(float(down_dist))
+        rand_pairs.append((
+            accession,
+            float(up_dist) if up_dist is not None else None,
+            float(down_dist) if down_dist is not None else None
+        ))
         placed += 1
 
     if placed < n_random:
         print(f"Warning: only placed {placed}/{n_random} random sequences for "
               f"{accession} after {max_attempts} attempts.")
 
-    return rand_ups, rand_downs, counts
+    return rand_pairs, counts
 
 
 def run_random_controls(
@@ -243,26 +304,31 @@ def run_random_controls(
     n_random: int,
     seed: int,
     nproc: int = 1,
-    verbose: bool = False
-) -> tuple[List[float], List[float], Dict[str, int]]:
+    verbose: bool = False,
+    anchor_mode: str = "endpoints",
+    anchor_pos: int = 31
+) -> tuple[List[float], List[float], Dict[str, int], List[tuple]]:
     """
     Collects alignment lengths per accession from filtered real results, then
     dispatches per-accession random placement to _random_one_accession.
     Parallelised across accessions using the same --nproc as the real pipeline.
     Each accession gets a unique deterministic seed (seed + accession_index).
-    Returns (rand_ups, rand_downs, aggregated_counts).
+    Returns (rand_ups, rand_downs, aggregated_counts, rand_pairs).
     """
     accession_lengths: Dict[str, List[int]] = defaultdict(list)
     for r in results_filtered:
         if not r.get('error') and r.get('align_start') is not None and r.get('align_end') is not None:
-            length = r['align_end'] - r['align_start']
+            # align_start/align_end are 1-based inclusive on output, so a 60 bp
+            # alignment spans end - start + 1 bases.
+            length = r['align_end'] - r['align_start'] + 1
             if length > 0:
                 accession_lengths[r['accession']].append(length)
 
     # Per-accession seeds: seed+i ensures reproducibility regardless of
     # which worker process handles which accession.
     tasks = [
-        (acc, lengths, genbank_dir, gb_naming, boundary_type, n_random, seed + i, verbose)
+        (acc, lengths, genbank_dir, gb_naming, boundary_type, n_random, seed + i,
+         verbose, anchor_mode, anchor_pos)
         for i, (acc, lengths) in enumerate(accession_lengths.items())
     ]
 
@@ -272,18 +338,19 @@ def run_random_controls(
     else:
         per_accession = [_random_one_accession(*t) for t in tasks]
 
-    rand_ups   = [v for ups, _, _   in per_accession for v in ups]
-    rand_downs = [v for _, downs, _ in per_accession for v in downs]
+    rand_pairs = [p for pairs, _ in per_accession for p in pairs]
+    rand_ups   = [u for _, u, _ in rand_pairs if u is not None]
+    rand_downs = [d for _, _, d in rand_pairs if d is not None]
 
     agg_counts: Dict[str, int] = {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
-    for _, _, counts in per_accession:
+    for _, counts in per_accession:
         for k in agg_counts:
             agg_counts[k] += counts[k]
 
-    return rand_ups, rand_downs, agg_counts
+    return rand_ups, rand_downs, agg_counts, rand_pairs
 
 
-def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False) -> Dict[str, Any]:
+def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool = False, anchor_mode: str = "endpoints", anchor_pos: int = 31) -> Dict[str, Any]:
     try:
         accession = region['accession']
         start, end = region['start'], region['end']   # always start <= end after parse_fasta_regions
@@ -298,9 +365,13 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
         if not best_aln:
             raise RuntimeError("No good alignment found")
 
-        coord_window_start = start          # normalised min coordinate
-        rel_start = coord_window_start + best_aln['start']
-        rel_end   = coord_window_start + best_aln['end']
+        # blastdbcmd -range is 1-based inclusive, so ref_seq[0] is 0-based genome
+        # index start-1. All arithmetic below is 0-based half-open, matching
+        # BioPython's SeqFeature coordinates, so distances against gene boundaries
+        # are exact. Coordinates are converted back to 1-based only on output.
+        win0 = start - 1
+        rel_start = win0 + best_aln['start']    # 0-based, inclusive
+        rel_end   = win0 + best_aln['end']      # 0-based, half-open
 
         gb_path = (
             Path(genbank_dir) / f"{accession}.gbff"
@@ -316,20 +387,36 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
         # counts are consistent across --boundary_type stop and start runs.
         location = classify_alignment(rel_start, rel_end, genes)
 
-        up_start, up_dist_start, down_start, down_dist_start = find_flanking_genes(rel_start, genes)
-        up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(rel_end, genes)
-        distances = [
-            ("start", rel_start, up_start, up_dist_start, down_start, down_dist_start),
-            ("end",   rel_end,   up_end,   up_dist_end,   down_end,   down_dist_end)
-        ]
-        min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
-        which, rel_boundary, up_gene, up_dist, down_gene, down_dist = min_tuple
+        if anchor_mode == "center":
+            # Measure from a single, biologically meaningful point: the centre of
+            # the trimmed target (the presumed insertion site), mapped through the
+            # alignment so gaps and reverse-strand entries are handled exactly.
+            off = map_query_pos_to_ref(best_aln, len(region['sequence']), anchor_pos)
+            if off is not None:
+                rel_boundary = win0 + off
+                anchor_source = "aligned"
+            else:
+                rel_boundary = (rel_start + rel_end) // 2
+                anchor_source = "midpoint_fallback"
+            which = "center"
+            up_gene, up_dist, down_gene, down_dist = find_flanking_genes(rel_boundary, genes)
+        else:
+            anchor_source = "endpoint_min"
+            up_start, up_dist_start, down_start, down_dist_start = find_flanking_genes(rel_start, genes)
+            up_end, up_dist_end, down_end, down_dist_end = find_flanking_genes(rel_end, genes)
+            distances = [
+                ("start", rel_start, up_start, up_dist_start, down_start, down_dist_start),
+                ("end",   rel_end,   up_end,   up_dist_end,   down_end,   down_dist_end)
+            ]
+            min_tuple = min(distances, key=lambda x: min(x[3] if x[2] else 1e12, x[5] if x[4] else 1e12))
+            which, rel_boundary, up_gene, up_dist, down_gene, down_dist = min_tuple
 
         up_gene_name       = up_gene['gene']      if up_gene   else None
         up_gene_boundary   = up_gene['boundary']  if up_gene   else None
         down_gene_name     = down_gene['gene']     if down_gene else None
         down_gene_boundary = down_gene['boundary'] if down_gene else None
 
+        # Coordinates out as 1-based inclusive; distances stay as computed.
         return {
             "accession": accession,
             "query": region.get('header'),
@@ -337,15 +424,17 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "location": location,
             "seq_start": start,
             "seq_end": end,
-            "align_start": rel_start,
+            "align_start": rel_start + 1,
             "align_end": rel_end,
+            "anchor": rel_boundary + 1,
+            "anchor_source": anchor_source,
             "which_boundary_used": which,
-            "boundary_used": rel_boundary,
+            "boundary_used": rel_boundary + 1,
             "up_gene": up_gene_name,
-            "up_boundary": up_gene_boundary,
+            "up_boundary": up_gene_boundary + 1 if up_gene_boundary is not None else None,
             "up_dist": up_dist,
             "down_gene": down_gene_name,
-            "down_boundary": down_gene_boundary,
+            "down_boundary": down_gene_boundary + 1 if down_gene_boundary is not None else None,
             "down_dist": down_dist,
             "score": best_aln['score'],
             "strand": best_aln['strand'],
@@ -362,6 +451,8 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
             "seq_end": region_base.get("end"),
             "align_start": None,
             "align_end": None,
+            "anchor": None,
+            "anchor_source": None,
             "which_boundary_used": None,
             "boundary_used": None,
             "up_gene": None,
@@ -376,8 +467,8 @@ def process_one_region(region: Dict[str, Any], genbank_dir: str, blast_db: str, 
         }
 
 
-def _proc(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool) -> Dict[str, Any]:
-    return process_one_region(region, genbank_dir, blast_db, temp_dir, gb_naming, boundary_type, verbose)
+def _proc(region: Dict[str, Any], genbank_dir: str, blast_db: str, temp_dir: str, gb_naming: str, boundary_type: str, verbose: bool, anchor_mode: str, anchor_pos: int) -> Dict[str, Any]:
+    return process_one_region(region, genbank_dir, blast_db, temp_dir, gb_naming, boundary_type, verbose, anchor_mode, anchor_pos)
 
 
 def parse_fasta_regions(fasta_path: str) -> List[Dict[str, Any]]:
@@ -385,13 +476,18 @@ def parse_fasta_regions(fasta_path: str) -> List[Dict[str, Any]]:
     for rec in SeqIO.parse(fasta_path, "fasta"):
         header = rec.id
         try:
-            parts = header.split('_')
-            if len(parts) != 2:
+            # Split on the LAST separator only: '_' occurs inside many accessions
+            # (NC_055040, NM_001126745, ...), so a plain split() would reject them
+            # and silently drop the record. Mirrors get_genbank.py's parsing.
+            if ':' in header:
+                accession, coord_part = header.rsplit(':', 1)
+            elif '_' in header:
+                accession, coord_part = header.rsplit('_', 1)
+            else:
                 raise ValueError(f"Header does not have expected format (ACCESSION_START-END): {header}")
-            coords = parts[1].split('-')
+            coords = coord_part.split('-')
             if len(coords) != 2:
                 raise ValueError(f"Coordinates not found or badly formatted in FASTA header: {header}")
-            accession = parts[0]
             raw_start, raw_end = int(coords[0]), int(coords[1])
 
             # Detect reverse-strand entries (start > end) and normalise so that
@@ -429,6 +525,22 @@ def main():
     parser.add_argument("--gb_naming", default="accession")
     parser.add_argument("--boundary_type", choices=["stop", "start"], default="stop",
                         help="Compare distance to either stop (default) or start codons of flanking genes")
+    parser.add_argument(
+        "--anchor", choices=["endpoints", "center"], default="endpoints",
+        help="Which point of the mapped target distances are measured from. "
+             "'endpoints' (default, legacy behaviour): try both alignment ends and "
+             "report whichever is closest to a gene boundary. 'center': measure from "
+             "a single position inside the target (see --anchor_pos), i.e. the "
+             "presumed insertion site. 'center' is the unbiased choice — 'endpoints' "
+             "is a min-of-two statistic that shifts distances downward."
+    )
+    parser.add_argument(
+        "--anchor_pos", type=int, default=31,
+        help="1-based position within the trimmed target used as the measurement "
+             "point when --anchor center, interpreted in the target's own "
+             "(stranded) orientation and mapped through the alignment. Default 31, "
+             "the first base past the midpoint of a 60 bp target."
+    )
     parser.add_argument(
         "--nproc", default=1, type=int,
         help="Number of parallel worker processes. On PBS, set this to match your "
@@ -491,7 +603,9 @@ def main():
         temp_dir=str(temp_dir),
         gb_naming=args.gb_naming,
         boundary_type=args.boundary_type,
-        verbose=args.verbose
+        verbose=args.verbose,
+        anchor_mode=args.anchor,
+        anchor_pos=args.anchor_pos
     )
     if args.nproc > 1:
         with Pool(args.nproc) as pool:
@@ -516,6 +630,7 @@ def main():
         fieldnames = [
             "accession", "query", "is_reverse", "location",
             "seq_start", "seq_end", "align_start", "align_end",
+            "anchor", "anchor_source",
             "which_boundary_used", "boundary_used",
             "up_gene", "up_boundary", "up_dist",
             "down_gene", "down_boundary", "down_dist",
@@ -562,11 +677,12 @@ def main():
         # Generate random controls, parallelised across accessions via --nproc
         rand_ups: List[float] = []
         rand_downs: List[float] = []
+        rand_pairs: List[tuple] = []
         rand_counts: Dict[str, int] = {'inside': 0, 'partial': 0, 'intergenic': 0, 'unannotated': 0}
         if args.n_random > 0:
             print(f"Generating random controls ({args.n_random} placements per genome, "
                   f"nproc={args.nproc})...")
-            rand_ups, rand_downs, rand_counts = run_random_controls(
+            rand_ups, rand_downs, rand_counts, rand_pairs = run_random_controls(
                 results_filtered,
                 args.genbank_dir,
                 args.gb_naming,
@@ -574,8 +690,26 @@ def main():
                 args.n_random,
                 args.random_seed,
                 nproc=args.nproc,
-                verbose=args.verbose
+                verbose=args.verbose,
+                anchor_mode=args.anchor,
+                anchor_pos=args.anchor_pos
             )
+
+            # Persist the null distances. Previously they were plotted and then
+            # discarded, so any later test against the null needed a full re-run.
+            # One row per accepted placement, same columns as distances.csv.
+            rand_out_path = output_dir / f"{Path(args.dist_out).stem}_random{Path(args.dist_out).suffix or '.csv'}"
+            with open(rand_out_path, "w", newline="") as rcsv:
+                writer = csv.writer(rcsv)
+                writer.writerow(["accession", "up_dist", "down_dist"])
+                for acc, up_d, down_d in rand_pairs:
+                    writer.writerow([
+                        acc,
+                        "" if up_d is None else up_d,
+                        "" if down_d is None else down_d
+                    ])
+            print(f"Random control distances written: {rand_out_path.resolve()} "
+                  f"({len(rand_pairs)} placements)")
 
         # --- Shared helpers (defined here so they close over args.xlim) ---
 
